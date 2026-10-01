@@ -9,4 +9,6 @@ Prints the sample orders field schema.
 Smoke Test
 python3 dataset_catalog.py dependencies daily_totals
 Returns orders as the only direct dependency.
+python3 dataset_catalog.py impact orders
+Returns daily_totals at distance 1 with path orders -> daily_totals.
 python3 -B -m unittest -v

@@ -46,6 +46,57 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(json.loads(query.stdout)["id"], "orders")
         self.assertEqual(subprocess.run(prefix + ["describe", "missing"], capture_output=True).returncode, 2)
 
+    def test_impact_follows_downstream_with_shortest_path(self):
+        self.catalog.register(self.raw)
+        self.catalog.register({"id": "middle", "fields": [{"name": "total", "type": "number"}], "depends_on": ["orders"]})
+        self.catalog.register({"id": "zed", "fields": [{"name": "total", "type": "number"}], "depends_on": ["orders"]})
+        self.catalog.register({"id": "target", "fields": [{"name": "total", "type": "number"}], "depends_on": ["zed", "middle"]})
+        self.catalog.register({"id": "leaf", "fields": [{"name": "total", "type": "number"}], "depends_on": ["target"]})
+        self.catalog.register({"id": "isolated", "fields": [{"name": "total", "type": "number"}]})
+        impact = self.catalog.impact("orders")
+        self.assertEqual([item["dataset"]["id"] for item in impact], ["middle", "zed", "target", "leaf"])
+        self.assertEqual(impact[0]["distance"], 1)
+        self.assertEqual(impact[0]["path"], ["orders", "middle"])
+        self.assertEqual(impact[2]["path"], ["orders", "middle", "target"])
+        self.assertEqual(impact[3]["path"], ["orders", "middle", "target", "leaf"])
+        self.assertEqual(impact[0]["dataset"], self.catalog.describe("middle"))
+        self.assertEqual([item["dataset"]["id"] for item in self.catalog.impact("orders", max_depth=1)], ["middle", "zed"])
+        self.assertEqual(self.catalog.impact("isolated"), [])
+
+    def test_impact_rejects_invalid_max_depth(self):
+        self.catalog.register(self.raw)
+        for value in (True, 0, -1, 1.0, "1"):
+            with self.assertRaises(ValueError):
+                self.catalog.impact("orders", value)
+        with self.assertRaises(ValueError):
+            self.catalog.impact("missing", 0)
+        with self.assertRaisesRegex(ValueError, "max_depth"):
+            self.catalog.impact("missing", 0)
+
+    def test_cli_impact(self):
+        sample = ["--catalog", str(ROOT / "samples/catalog.json")]
+        run = lambda *extra: subprocess.run(
+            [sys.executable, str(ROOT / "dataset_catalog.py")] + sample + ["impact", *extra],
+            capture_output=True, text=True)
+        ok = run("orders")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        payload = json.loads(ok.stdout)
+        self.assertEqual(payload, [{
+            "dataset": DatasetCatalog(ROOT / "samples/catalog.json").describe("daily_totals"),
+            "distance": 1, "path": ["orders", "daily_totals"]}])
+        self.assertEqual(json.loads(run("daily_totals").stdout), [])
+        self.assertEqual(run("orders", "--max-depth", "1").returncode, 0)
+        for bad in ("0", "-1", "1.0", "ab", " 1", "1 "):
+            failed = run("orders", "--max-depth", bad)
+            self.assertEqual(failed.returncode, 2, bad)
+            self.assertIn("error", json.loads(failed.stdout))
+        missing = run("missing")
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stdout))
+        depth_first = run("missing", "--max-depth", "0")
+        self.assertEqual(depth_first.returncode, 2)
+        self.assertNotIn("unknown", json.loads(depth_first.stdout)["error"])
+
 
 if __name__ == "__main__":
     unittest.main()
