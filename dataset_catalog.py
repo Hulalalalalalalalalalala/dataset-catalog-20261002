@@ -50,6 +50,40 @@ class DatasetCatalog:
         entry = self.describe(identifier)
         return [self.describe(key) for key in entry["depends_on"]]
 
+    def impact(self, identifier, max_depth=None):
+        if max_depth is not None and (isinstance(max_depth, bool)
+                                      or not isinstance(max_depth, int) or max_depth <= 0):
+            raise ValueError("max_depth must be None or a positive integer")
+        records = self.entries()
+        if identifier not in records:
+            raise ValueError("unknown dataset")
+        downstream = {}
+        for key, entry in records.items():
+            for source in entry["depends_on"]:
+                downstream.setdefault(source, set()).add(key)
+        reached = {identifier: [identifier]}
+        frontier = {identifier: [identifier]}
+        result = []
+        distance = 0
+        while frontier and (max_depth is None or distance < max_depth):
+            distance += 1
+            candidates = {}
+            for node, path in frontier.items():
+                for child in downstream.get(node, ()):  # unconnected records are never reached
+                    if child in reached:
+                        continue
+                    candidate = path + [child]
+                    if child not in candidates or candidate < candidates[child]:
+                        candidates[child] = candidate
+            if not candidates:
+                break
+            frontier = candidates
+            reached.update(candidates)
+            for child, path in candidates.items():
+                result.append({"dataset": records[child], "distance": distance, "path": path})
+        result.sort(key=lambda item: (item["distance"], item["dataset"]["id"]))
+        return result
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -58,10 +92,25 @@ def main():
     commands.add_parser("register").add_argument("file")
     commands.add_parser("describe").add_argument("id")
     commands.add_parser("dependencies").add_argument("id")
+    impact = commands.add_parser("impact")
+    impact.add_argument("id")
+    impact.add_argument("--max-depth")
     args = parser.parse_args()
     try:
         catalog = DatasetCatalog(args.catalog)
-        result = catalog.register(json.loads(Path(args.file).read_text(encoding="utf-8"))) if args.command == "register" else getattr(catalog, args.command)(args.id)
+        if args.command == "register":
+            result = catalog.register(json.loads(Path(args.file).read_text(encoding="utf-8")))
+        elif args.command == "impact":
+            raw_depth = args.max_depth
+            if raw_depth is not None:
+                if not re.fullmatch(r"[0-9]+", raw_depth) or int(raw_depth) <= 0:
+                    raise ValueError("invalid max_depth")
+                max_depth = int(raw_depth)
+            else:
+                max_depth = None
+            result = catalog.impact(args.id, max_depth=max_depth)
+        else:
+            result = getattr(catalog, args.command)(args.id)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     except (OSError, ValueError, KeyError, TypeError) as exc:
