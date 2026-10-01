@@ -1,0 +1,1 @@
+{"orders":{"id":"orders","description":"Order amounts from the daily export","fields":[{"name":"order_id","type":"string"},{"name":"amount","type":"number"}],"depends_on":[]},"daily_totals":{"id":"daily_totals","description":"Daily totals derived from orders","fields":[{"name":"day","type":"string"},{"name":"total","type":"number"}],"depends_on":["orders"]}}

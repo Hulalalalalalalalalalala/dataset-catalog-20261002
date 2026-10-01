@@ -1,0 +1,12 @@
+Install
+python3 --version
+Python 3.10 or newer; no external dependencies.
+
+Start
+python3 dataset_catalog.py describe orders
+Prints the sample orders field schema.
+
+Smoke Test
+python3 dataset_catalog.py dependencies daily_totals
+Returns orders as the only direct dependency.
+python3 -B -m unittest -v

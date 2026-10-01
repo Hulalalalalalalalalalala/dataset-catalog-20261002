@@ -1,0 +1,1 @@
+{"id":"daily_totals","description":"Daily totals derived from orders","fields":[{"name":"day","type":"string"},{"name":"total","type":"number"}],"depends_on":["orders"]}

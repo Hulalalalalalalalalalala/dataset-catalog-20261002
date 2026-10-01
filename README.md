@@ -1,0 +1,9 @@
+# Dataset Catalog
+
+A local registry of dataset fields and direct dependencies, requiring Python 3.10+ and no third-party packages. It records descriptions and schemas, not the dataset contents.
+
+`python3 dataset_catalog.py describe orders` reads the included sample catalog. `python3 dataset_catalog.py dependencies daily_totals` returns the registered orders entry; queries are direct-only, not transitive. The two sample descriptors are `samples/orders.json` and `samples/daily.json`.
+
+To create a separate catalog, run `python3 dataset_catalog.py --catalog .state/catalog.json register samples/orders.json`, then register `samples/daily.json` in that same catalog. IDs must start with a lowercase letter and contain lowercase letters, digits, underscores or hyphens. Each dataset needs unique field names and field types string, integer, number or boolean. Dependencies must already be registered; registration cannot overwrite an existing ID. This append-only registration order prevents new entries from forming dependency cycles. There is no schema evolution, deletion or file ingestion command.
+
+`DatasetCatalog.register`, `describe` and `dependencies` expose the same API. CLI errors are JSON and exit 2. Run `python3 -B -m unittest -v` for persistence, dependency validation and CLI tests.
