@@ -146,6 +146,111 @@ class CatalogTests(unittest.TestCase):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(records), encoding="utf-8")
 
+    def test_search_matches_keywords_across_id_description_and_field_names(self):
+        self._write_records({
+            "orders": {"id": "orders", "description": "Order amounts from the daily export",
+                       "fields": [{"name": "order_id", "type": "string"},
+                                  {"name": "amount", "type": "number"}], "depends_on": []},
+            "daily_totals": {"id": "daily_totals", "description": "Daily totals derived from orders",
+                             "fields": [{"name": "day", "type": "string"},
+                                        {"name": "total", "type": "number"}],
+                             "depends_on": ["orders"]}})
+        result = self.catalog.search("daily amount")
+        self.assertEqual([row["dataset"]["id"] for row in result], ["orders"])
+        self.assertEqual(result[0]["matched_fields"], ["amount"])
+        self.assertEqual(result[0]["dataset"], self.catalog.describe("orders"))
+        result = self.catalog.search("orders")
+        self.assertEqual([row["dataset"]["id"] for row in result], ["daily_totals", "orders"])
+        self.assertTrue(all(row["matched_fields"] == [] for row in result))
+
+    def test_search_treats_repeated_and_split_words_with_casefold(self):
+        self._write_records({
+            "a": {"id": "a", "description": "first dataset",
+                  "fields": [{"name": "user_name", "type": "string"},
+                             {"name": "count", "type": "integer"}], "depends_on": []}})
+        result = self.catalog.search("  USER   user  COUNT")
+        self.assertEqual([row["dataset"]["id"] for row in result], ["a"])
+        self.assertEqual(result[0]["matched_fields"], ["user_name", "count"])
+        self.assertEqual(self.catalog.search("USERNAME"), [])
+        self.assertEqual(self.catalog.search("count")[0]["matched_fields"], ["count"])
+
+    def test_search_does_not_match_dependency_ids_or_field_type_text(self):
+        self._write_records({
+            "a": {"id": "a", "description": "", "fields": [{"name": "n", "type": "integer"}],
+                  "depends_on": ["zz_hidden"]},
+            "zz_hidden": {"id": "zz_hidden", "description": "",
+                          "fields": [{"name": "flag", "type": "boolean"}], "depends_on": []}})
+        self.assertEqual([row["dataset"]["id"] for row in self.catalog.search("zz_hidden")], ["zz_hidden"])
+        self.assertEqual(self.catalog.search("integer"), [])
+
+    def test_search_empty_query_and_field_type_filter(self):
+        self._write_records({
+            "a": {"id": "a", "description": "first",
+                  "fields": [{"name": "n", "type": "integer"},
+                             {"name": "label", "type": "string"}], "depends_on": []},
+            "b": {"id": "b", "description": "second",
+                  "fields": [{"name": "ratio", "type": "number"}], "depends_on": []}})
+        self.assertEqual([row["dataset"]["id"] for row in self.catalog.search()], ["a", "b"])
+        self.assertEqual([row["dataset"]["id"] for row in self.catalog.search("   ")], ["a", "b"])
+        self.assertEqual([row["dataset"]["id"] for row in self.catalog.search(field_type="number")], ["b"])
+        self.assertEqual([row["dataset"]["id"] for row in self.catalog.search(field_type="integer")], ["a"])
+        result = self.catalog.search("first", field_type="number")
+        self.assertEqual(result, [])
+        result = self.catalog.search("n", field_type="integer")
+        self.assertEqual(result[0]["matched_fields"], ["n"])
+
+    def test_search_validates_arguments_before_reading_catalog(self):
+        self.assertFalse(self.path.exists())
+        for bad in (1, None, b"x", ["a"]):
+            with self.assertRaises(ValueError):
+                self.catalog.search(bad)
+        for bad in ("float", "STRING", "", 1, True):
+            with self.assertRaises(ValueError):
+                self.catalog.search("q", bad)
+        self.assertEqual(self.catalog.search(), [])
+        self.assertEqual(self.catalog.search("q", "string"), [])
+        self.assertFalse(self.path.exists())
+
+    def test_search_does_not_modify_catalog(self):
+        self._write_records({
+            "a": {"id": "a", "description": "", "fields": [{"name": "n", "type": "integer"}],
+                  "depends_on": []}})
+        before = self.path.read_text(encoding="utf-8")
+        self.catalog.search("a", "integer")
+        self.catalog.search("")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_cli_search(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")], check=True, capture_output=True)
+        subprocess.run(prefix + ["register", str(ROOT / "samples/daily.json")], check=True, capture_output=True)
+        run = subprocess.run(prefix + ["search", "daily amount"], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual([row["dataset"]["id"] for row in result], ["orders"])
+        self.assertEqual(result[0]["matched_fields"], ["amount"])
+        empty = subprocess.run(prefix + ["search"], capture_output=True, text=True)
+        self.assertEqual(empty.returncode, 0)
+        self.assertEqual([row["dataset"]["id"] for row in json.loads(empty.stdout)],
+                         ["daily_totals", "orders"])
+        none = subprocess.run(prefix + ["search", "nothing-matches"], capture_output=True, text=True)
+        self.assertEqual(json.loads(none.stdout), [])
+        bad = subprocess.run(prefix + ["search", "x", "--field-type", "float"],
+                             capture_output=True, text=True)
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stdout))
+
+    def test_cli_search_missing_catalog_file(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        run = subprocess.run(prefix + ["search", "x", "--field-type", "float"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+        run = subprocess.run(prefix + ["search"], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0)
+        self.assertEqual(json.loads(run.stdout), [])
+        self.assertFalse(self.path.exists())
+
     def _record(self, identifier, depends_on):
         return {"id": identifier, "description": "",
                 "fields": [{"name": "n", "type": "integer"}], "depends_on": depends_on}

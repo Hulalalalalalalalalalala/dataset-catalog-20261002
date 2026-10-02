@@ -13,4 +13,8 @@ python3 dataset_catalog.py impact orders
 Returns daily_totals at distance 1 with path ["orders","daily_totals"].
 python3 dataset_catalog.py export --id daily_totals
 Returns {"datasets":[orders record, daily_totals record]}, dependencies first.
+python3 dataset_catalog.py search "daily amount"
+Returns only orders with matched_fields ["amount"]; search is read-only.
+python3 dataset_catalog.py search --field-type integer
+Lists datasets having an integer field; an omitted query means no keyword restriction.
 python3 -B -m unittest -v

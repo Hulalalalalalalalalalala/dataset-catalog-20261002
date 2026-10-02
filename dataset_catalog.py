@@ -6,6 +6,9 @@ import re
 from pathlib import Path
 
 
+FIELD_TYPES = ("string", "integer", "number", "boolean")
+
+
 class DatasetCatalog:
     def __init__(self, path):
         self.path = Path(path)
@@ -32,7 +35,7 @@ class DatasetCatalog:
             name = field["name"]
             if not isinstance(name, str) or not name.strip():
                 raise ValueError("field names must be nonempty strings")
-            if field["type"] not in ("string", "integer", "number", "boolean"):
+            if field["type"] not in FIELD_TYPES:
                 raise ValueError("unsupported field type")
             names.append(name)
         if len(set(names)) != len(names):
@@ -55,6 +58,34 @@ class DatasetCatalog:
         if identifier not in records:
             raise ValueError("unknown dataset")
         return records[identifier]
+
+    def search(self, query="", field_type=None):
+        if not isinstance(query, str):
+            raise ValueError("query must be a string")
+        if field_type is not None and field_type not in FIELD_TYPES:
+            raise ValueError("field_type must be None or one of string, integer, number, boolean")
+        words = {word.casefold() for word in query.split()}
+        records = self.entries()
+        results = []
+        for identifier in sorted(records):
+            entry = records[identifier]
+            if field_type is not None and not any(field["type"] == field_type for field in entry["fields"]):
+                continue
+            matched_indices = set()
+            matched = True
+            dataset_haystack = (entry["id"] + "\n" + entry.get("description", "")).casefold()
+            for word in words:
+                hits = {index for index, field in enumerate(entry["fields"])
+                        if word in field["name"].casefold()}
+                matched_indices.update(hits)
+                if not hits and word not in dataset_haystack:
+                    matched = False
+                    break
+            if matched:
+                results.append({"dataset": entry,
+                                "matched_fields": [entry["fields"][index]["name"]
+                                                   for index in sorted(matched_indices)]})
+        return results
 
     def dependencies(self, identifier):
         entry = self.describe(identifier)
@@ -153,6 +184,9 @@ def main():
     impact.add_argument("--max-depth")
     export = commands.add_parser("export")
     export.add_argument("--id", action="append", dest="ids")
+    search = commands.add_parser("search")
+    search.add_argument("query", nargs="?", default="")
+    search.add_argument("--field-type", dest="field_type")
     args = parser.parse_args()
     try:
         catalog = DatasetCatalog(args.catalog)
@@ -169,6 +203,8 @@ def main():
             else:
                 max_depth = None
             result = catalog.impact(args.id, max_depth=max_depth)
+        elif args.command == "search":
+            result = catalog.search(args.query, args.field_type)
         else:
             result = getattr(catalog, args.command)(args.id)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
