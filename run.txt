@@ -24,6 +24,12 @@ python3 dataset_catalog.py preview FILE
 Prints {"diff":{...},"affected":[...]}: the diff result plus every downstream dataset reached from
 an added, removed or changed source, with lexicographically-smallest shortest before/after paths;
 read-only, errors exit 2.
+python3 dataset_catalog.py schema-diff FILE
+Reviews read-only field changes against a complete {"datasets":[...]} snapshot (catalog = before)
+and prints {"changes":[...]} sorted by dataset id; each item holds only id, added_fields,
+removed_fields (name/type pairs), type_changes (name/before/after) and breaking, arrays sorted by
+field name; breaking is true for any removed field or non-integer-to-number type change;
+read-only, errors exit 2.
 python3 dataset_catalog.py apply FILE
 Commits a {"datasets":[...]} snapshot file as the complete catalog state (same-id records replaced,
 new ids added, absent records removed) and prints the pre-commit

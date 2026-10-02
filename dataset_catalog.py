@@ -407,6 +407,52 @@ class DatasetCatalog:
                 affected.append({"id": target, "causes": causes})
         return {"diff": diff, "affected": affected}
 
+    @staticmethod
+    def _field_map(entry):
+        return {field["name"]: field["type"] for field in entry["fields"]}
+
+    @staticmethod
+    def _schema_diff_states(current, snapshot):
+        changes = []
+        for key in sorted(set(current) | set(snapshot)):
+            if key in current and key in snapshot:
+                before_fields = DatasetCatalog._field_map(current[key])
+                after_fields = DatasetCatalog._field_map(snapshot[key])
+                added_names = sorted(set(after_fields) - set(before_fields))
+                removed_names = sorted(set(before_fields) - set(after_fields))
+                shared_names = sorted(set(before_fields) & set(after_fields))
+            elif key in snapshot:
+                before_fields = {}
+                after_fields = DatasetCatalog._field_map(snapshot[key])
+                added_names = sorted(after_fields)
+                removed_names = []
+                shared_names = []
+            else:
+                before_fields = DatasetCatalog._field_map(current[key])
+                after_fields = {}
+                added_names = []
+                removed_names = sorted(before_fields)
+                shared_names = []
+            added_fields = [{"name": name, "type": after_fields[name]} for name in added_names]
+            removed_fields = [{"name": name, "type": before_fields[name]} for name in removed_names]
+            type_changes = [{"name": name, "before": before_fields[name], "after": after_fields[name]}
+                            for name in shared_names
+                            if before_fields[name] != after_fields[name]]
+            if not added_fields and not removed_fields and not type_changes:
+                continue
+            breaking = bool(removed_fields) or any(
+                not (change["before"] == "integer" and change["after"] == "number")
+                for change in type_changes)
+            changes.append({"id": key, "added_fields": added_fields,
+                            "removed_fields": removed_fields, "type_changes": type_changes,
+                            "breaking": breaking})
+        return {"changes": changes}
+
+    def schema_diff_bundle(self, bundle):
+        snapshot = self._snapshot_state(bundle)
+        current = self._current_state()
+        return self._schema_diff_states(current, snapshot)
+
     def _save_records(self, records):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = json.dumps(records, ensure_ascii=False, indent=2) + "\n"
@@ -446,6 +492,10 @@ def main():
     commands.add_parser("preview",
                         help="diff a snapshot bundle and preview the downstream impact of the change"
                         ).add_argument("file")
+    commands.add_parser("schema-diff",
+                        help="review read-only field additions, removals and type changes against "
+                             "a complete snapshot bundle"
+                        ).add_argument("file")
     apply_cmd = commands.add_parser("apply",
                                     help="apply a snapshot bundle as the complete catalog state")
     apply_cmd.add_argument("file")
@@ -475,6 +525,8 @@ def main():
             result = catalog.diff_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "preview":
             result = catalog.preview_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
+        elif args.command == "schema-diff":
+            result = catalog.schema_diff_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "apply":
             bundle = json.loads(Path(args.file).read_text(encoding="utf-8"))
             if args.expected is None:

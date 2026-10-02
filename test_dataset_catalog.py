@@ -1408,5 +1408,341 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(self.path.read_text(encoding="utf-8"), before)
 
 
+    def _schema_record(self, identifier, fields, depends_on=None, description="s", **extra):
+        record = {"id": identifier, "description": description,
+                  "fields": fields, "depends_on": depends_on or []}
+        record.update(extra)
+        return record
+
+    def test_schema_diff_add_remove_and_type_change_structure(self):
+        self.catalog.import_bundle({"datasets": [
+            self._schema_record("a", [{"name": "keep", "type": "string"},
+                                      {"name": "gone", "type": "integer"},
+                                      {"name": "widened", "type": "integer"},
+                                      {"name": "narrowed", "type": "number"},
+                                      {"name": "switched", "type": "string"}]),
+            self._schema_record("b", [{"name": "n", "type": "integer"}], ["a"])]})
+        bundle = {"datasets": [
+            self._schema_record("a", [{"name": "fresh", "type": "boolean"},
+                                      {"name": "keep", "type": "string"},
+                                      {"name": "widened", "type": "number"},
+                                      {"name": "narrowed", "type": "integer"},
+                                      {"name": "switched", "type": "boolean"}]),
+            self._schema_record("b", [{"name": "n", "type": "integer"}], ["a"])]}
+        result = self.catalog.schema_diff_bundle(bundle)
+        self.assertEqual(set(result), {"changes"})
+        self.assertEqual([row["id"] for row in result["changes"]], ["a"])
+        change = result["changes"][0]
+        self.assertEqual(set(change),
+                         {"id", "added_fields", "removed_fields", "type_changes", "breaking"})
+        self.assertEqual(change["added_fields"], [{"name": "fresh", "type": "boolean"}])
+        self.assertEqual(change["removed_fields"], [{"name": "gone", "type": "integer"}])
+        self.assertEqual(change["type_changes"], [
+            {"name": "narrowed", "before": "number", "after": "integer"},
+            {"name": "switched", "before": "string", "after": "boolean"},
+            {"name": "widened", "before": "integer", "after": "number"}])
+        self.assertIs(change["breaking"], True)
+
+    def test_schema_diff_integer_to_number_is_not_breaking(self):
+        self.catalog.import_bundle({"datasets": [
+            self._schema_record("a", [{"name": "x", "type": "integer"},
+                                      {"name": "y", "type": "integer"},
+                                      {"name": "z", "type": "string"}])]})
+        bundle = {"datasets": [
+            self._schema_record("a", [{"name": "x", "type": "number"},
+                                      {"name": "y", "type": "integer"},
+                                      {"name": "z", "type": "string"}])]}
+        change = self.catalog.schema_diff_bundle(bundle)["changes"]
+        self.assertEqual(len(change), 1)
+        self.assertEqual(change[0]["added_fields"], [])
+        self.assertEqual(change[0]["removed_fields"], [])
+        self.assertEqual(change[0]["type_changes"],
+                         [{"name": "x", "before": "integer", "after": "number"}])
+        self.assertIs(change[0]["breaking"], False)
+
+        for before_type, after_type in (("number", "integer"), ("string", "integer"),
+                                        ("integer", "string"), ("boolean", "string"),
+                                        ("string", "boolean"), ("number", "string")):
+            other = Path(self.temp.name) / ("types-" + before_type + "-" + after_type + ".json")
+            catalog = DatasetCatalog(other)
+            catalog.import_bundle({"datasets": [
+                self._schema_record("a", [{"name": "f", "type": before_type}])]})
+            row = catalog.schema_diff_bundle({"datasets": [
+                self._schema_record("a", [{"name": "f", "type": after_type}])]})["changes"][0]
+            self.assertIs(row["breaking"], True, (before_type, after_type))
+            self.assertEqual(row["type_changes"],
+                             [{"name": "f", "before": before_type, "after": after_type}])
+
+    def test_schema_diff_new_dataset_all_added_and_deleted_all_removed(self):
+        self.catalog.import_bundle({"datasets": [
+            self._schema_record("old", [{"name": "a", "type": "integer"},
+                                        {"name": "b", "type": "string"}])]})
+        result = self.catalog.schema_diff_bundle({"datasets": [
+            self._schema_record("old", [{"name": "a", "type": "integer"},
+                                        {"name": "b", "type": "string"}]),
+            self._schema_record("new", [{"name": "x", "type": "number"},
+                                        {"name": "y", "type": "boolean"}], ["old"])]})
+        changes = result["changes"]
+        self.assertEqual([row["id"] for row in changes], ["new"])
+        added_only = changes[0]
+        self.assertEqual(added_only["added_fields"],
+                         [{"name": "x", "type": "number"}, {"name": "y", "type": "boolean"}])
+        self.assertEqual(added_only["removed_fields"], [])
+        self.assertEqual(added_only["type_changes"], [])
+        self.assertIs(added_only["breaking"], False)
+        # deleting a dataset means all its fields are removed
+        empty = self.catalog.schema_diff_bundle({"datasets": []})["changes"]
+        self.assertEqual(len(empty), 1)
+        self.assertEqual(empty[0]["id"], "old")
+        self.assertEqual(empty[0]["added_fields"], [])
+        self.assertEqual(empty[0]["type_changes"], [])
+        self.assertEqual(empty[0]["removed_fields"],
+                         [{"name": "a", "type": "integer"}, {"name": "b", "type": "string"}])
+        self.assertIs(empty[0]["breaking"], True)
+
+    def test_schema_diff_arrays_sorted_by_unicode_codepoint(self):
+        fields = [{"name": name, "type": "string"}
+                  for name in ("b", "a", "A", "B", "01", "日", "é", "abc")]
+        self.catalog.import_bundle({"datasets": [self._schema_record("a", fields)]})
+        result = self.catalog.schema_diff_bundle({"datasets": []})
+        removed = [row["name"] for row in result["changes"][0]["removed_fields"]]
+        self.assertEqual(removed, sorted(removed))
+        self.assertEqual(removed, ["01", "A", "B", "a", "abc", "b", "é", "日"])
+
+        other = Path(self.temp.name) / "unicode-add.json"
+        catalog = DatasetCatalog(other)
+        after = [{"name": name, "type": "integer"} for name in ("中", "Z", "a", "!")]
+        changes = catalog.schema_diff_bundle({"datasets": [
+            self._schema_record("a", after)]})["changes"]
+        added = [row["name"] for row in changes[0]["added_fields"]]
+        self.assertEqual(added, ["!", "Z", "a", "中"])
+        self.assertEqual(changes[0]["added_fields"][0], {"name": "!", "type": "integer"})
+
+    def test_schema_diff_rename_is_remove_plus_add_and_matches_names_exactly(self):
+        self.catalog.import_bundle({"datasets": [
+            self._schema_record("a", [{"name": "Amount", "type": "integer"},
+                                      {"name": " id ", "type": "string"}])]})
+        bundle = {"datasets": [
+            self._schema_record("a", [{"name": "amount", "type": "integer"},
+                                      {"name": "id", "type": "string"}])]}
+        change = self.catalog.schema_diff_bundle(bundle)["changes"][0]
+        self.assertEqual(change["added_fields"], [{"name": "amount", "type": "integer"},
+                                                  {"name": "id", "type": "string"}])
+        self.assertEqual(change["removed_fields"], [{"name": " id ", "type": "string"},
+                                                    {"name": "Amount", "type": "integer"}])
+        self.assertEqual(change["type_changes"], [])
+        self.assertIs(change["breaking"], True)
+
+        # case-only or whitespace-only differences never line up as type changes
+        other = Path(self.temp.name) / "exact.json"
+        catalog = DatasetCatalog(other)
+        catalog.import_bundle({"datasets": [
+            self._schema_record("a", [{"name": "x", "type": "integer"}])]})
+        row = catalog.schema_diff_bundle({"datasets": [
+            self._schema_record("a", [{"name": "x", "type": "integer"},
+                                      {"name": "x ", "type": "number"}])]})["changes"][0]
+        self.assertEqual(row["added_fields"], [{"name": "x ", "type": "number"}])
+        self.assertEqual(row["type_changes"], [])
+
+    def test_schema_diff_ignores_metadata_and_field_order_but_diff_keeps_order_rule(self):
+        records = {"datasets": [
+            self._schema_record("a", [{"name": "z", "type": "integer"},
+                                      {"name": "n", "type": "integer"}], ["b"],
+                                tags=["t"], owner="team"),
+            self._schema_record("b", [{"name": "n", "type": "integer"}])]}
+        self.catalog.import_bundle(records)
+        changed = {"datasets": [
+            self._schema_record("b", [{"name": "n", "type": "integer"}], description="new desc"),
+            self._schema_record("a", [{"name": "n", "type": "integer"},
+                                      {"name": "z", "type": "integer"}], ["b"],
+                                description="other", tags=["t"], owner="team")]}
+        self.assertEqual(self.catalog.schema_diff_bundle(changed), {"changes": []})
+        # the legacy diff still treats a pure field reorder as a change
+        self.assertEqual(
+            [row["changed_keys"] for row in self.catalog.diff_bundle(changed)["changed"]],
+            [["description", "fields"], ["description"]])
+
+        reordered_only = {"datasets": [
+            self._schema_record("a", [{"name": "n", "type": "integer"},
+                                      {"name": "z", "type": "integer"}], ["b"],
+                                tags=["t"], owner="team"),
+            self._schema_record("b", [{"name": "n", "type": "integer"}])]}
+        self.assertEqual(self.catalog.schema_diff_bundle(reordered_only), {"changes": []})
+        self.assertEqual(
+            [row["changed_keys"] for row in self.catalog.diff_bundle(reordered_only)["changed"]],
+            [["fields"]])
+
+    def test_schema_diff_empty_arrays_preserved_on_field_change_only(self):
+        self.catalog.import_bundle({"datasets": [
+            self._schema_record("a", [{"name": "n", "type": "integer"}])]})
+        change = self.catalog.schema_diff_bundle({"datasets": [
+            self._schema_record("a", [{"name": "n", "type": "number"}])]})["changes"][0]
+        self.assertEqual(change["added_fields"], [])
+        self.assertEqual(change["removed_fields"], [])
+        self.assertEqual(change["type_changes"],
+                         [{"name": "n", "before": "integer", "after": "number"}])
+        self.assertIs(change["breaking"], False)
+
+    def test_schema_diff_changes_sorted_by_id_and_unchanged_omitted(self):
+        self.catalog.import_bundle({"datasets": [
+            self._schema_record("a", [{"name": "n", "type": "integer"}]),
+            self._schema_record("b", [{"name": "n", "type": "integer"}]),
+            self._schema_record("c", [{"name": "n", "type": "integer"}])]})
+        result = self.catalog.schema_diff_bundle({"datasets": [
+            self._schema_record("a", [{"name": "n", "type": "string"}]),
+            self._schema_record("b", [{"name": "n", "type": "integer"}]),
+            self._schema_record("c", [{"name": "n", "type": "integer"},
+                                      {"name": "x", "type": "boolean"}])]})
+        self.assertEqual([row["id"] for row in result["changes"]], ["a", "c"])
+
+    def test_schema_diff_missing_or_empty_catalog_and_empty_snapshot(self):
+        self.assertFalse(self.path.exists())
+        result = self.catalog.schema_diff_bundle({"datasets": [
+            self._schema_record("a", [{"name": "n", "type": "integer"}])]})
+        self.assertEqual([row["id"] for row in result["changes"]], ["a"])
+        self.assertEqual(result["changes"][0]["added_fields"],
+                         [{"name": "n", "type": "integer"}])
+        self.assertFalse(self.path.exists())
+
+        self.path.write_text("{}", encoding="utf-8")
+        self.assertEqual(DatasetCatalog(self.path).schema_diff_bundle({"datasets": []}),
+                         {"changes": []})
+
+        self.catalog.import_bundle({"datasets": [
+            self._schema_record("a", [{"name": "n", "type": "integer"}])]})
+        self.assertEqual(self.catalog.schema_diff_bundle({"datasets": []})["changes"][0]["id"], "a")
+
+    def test_schema_diff_validates_both_graphs_even_for_metadata_only_changes(self):
+        self.catalog.register(self._snapshot_record("old"))
+        bad_bundles = [
+            [], None, "x", 1, True, {},
+            {"datasets": None}, {"datasets": {}}, {"datasets": "x"}, {"datasets": 1},
+            {"other": []},
+            {"datasets": [None]},
+            {"datasets": ["x"]},
+            {"datasets": [{"id": "bad id", "fields": [{"name": "n", "type": "integer"}]}]},
+            {"datasets": [{"id": "a"}]},
+            {"datasets": [{"id": "a", "fields": [{"name": "n", "type": "float"}]}]},
+            {"datasets": [self._snapshot_record("a"), self._snapshot_record("a")]},
+            {"datasets": [self._snapshot_record("a", ["a"])]},
+            {"datasets": [self._snapshot_record("a", ["b", "b"])]},
+            {"datasets": [self._snapshot_record("a", ["ghost"])]},
+            {"datasets": [self._snapshot_record("a", ["b"]), self._snapshot_record("b", ["a"])]},
+            {"datasets": [self._snapshot_record("a", tags=[""])]},
+        ]
+        for bundle in bad_bundles:
+            with self.assertRaises(ValueError):
+                self.catalog.schema_diff_bundle(bundle)
+
+        # validation still runs when the invalid snapshot would otherwise only change metadata
+        for index, bundle in enumerate(bad_bundles):
+            other = Path(self.temp.name) / ("bad-schema-snapshot-" + str(index) + ".json")
+            catalog = DatasetCatalog(other)
+            catalog.register(self._snapshot_record("old"))
+            with self.assertRaises(ValueError):
+                catalog.schema_diff_bundle(bundle)
+
+        # an invalid current catalog is rejected like in preview
+        good = json.dumps({"datasets": [self._snapshot_record("a")]})
+        bad_states = [
+            json.dumps([self._snapshot_record("a")]),
+            json.dumps({"a": "x"}),
+            json.dumps({"a": self._snapshot_record("a", ["ghost"])}),
+            json.dumps({"a": self._snapshot_record("a", ["a"])}),
+            json.dumps({"a": self._snapshot_record("a", ["b", "b"]),
+                        "b": self._snapshot_record("b")}),
+            json.dumps({"a": {**self._snapshot_record("a"), "id": "other"}}),
+            json.dumps({"a": self._snapshot_record("a", ["b"]),
+                        "b": self._snapshot_record("b", ["a"])}),
+        ]
+        for raw in bad_states:
+            other = Path(self.temp.name) / "bad-schema-catalog.json"
+            other.write_text(raw, encoding="utf-8")
+            with self.assertRaises(ValueError):
+                DatasetCatalog(other).schema_diff_bundle(json.loads(good))
+
+    def test_schema_diff_does_not_mutate_inputs_or_write_files(self):
+        self.catalog.import_bundle({"datasets": [
+            self._schema_record("a", [{"name": "n", "type": "integer"}])]})
+        catalog_before = self.path.read_text(encoding="utf-8")
+        bundle = {"datasets": [
+            self._schema_record("a", [{"name": "n", "type": "number"},
+                                      {"name": "x", "type": "boolean"}])], "ignored": True}
+        snapshot = json.loads(json.dumps(bundle))
+        result = self.catalog.schema_diff_bundle(bundle)
+        self.assertEqual(bundle, snapshot)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+        result["changes"][0]["added_fields"].append({"name": "tampered", "type": "string"})
+        result["changes"][0]["type_changes"][0]["after"] = "string"
+        again = self.catalog.schema_diff_bundle(bundle)["changes"][0]
+        self.assertEqual(again["added_fields"], [{"name": "x", "type": "boolean"}])
+        self.assertEqual(again["type_changes"][0]["after"], "number")
+
+        nested = Path(self.temp.name) / "state" / "nested" / "catalog.json"
+        empty_catalog = DatasetCatalog(nested)
+        self.assertEqual(empty_catalog.schema_diff_bundle({"datasets": []}), {"changes": []})
+        self.assertFalse(nested.exists())
+        self.assertFalse(nested.parent.exists())
+
+    def test_cli_schema_diff_success_and_errors(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")],
+                       check=True, capture_output=True)
+        subprocess.run(prefix + ["register", str(ROOT / "samples/daily.json")],
+                       check=True, capture_output=True)
+        catalog_before = self.path.read_text(encoding="utf-8")
+
+        snapshot_path = Path(self.temp.name) / "snapshot.json"
+        snapshot_path.write_text(json.dumps({"datasets": [
+            {"id": "orders", "description": "Order amounts from the daily export",
+             "fields": [{"name": "order_id", "type": "string"},
+                        {"name": "amount", "type": "number"}], "depends_on": []},
+            {"id": "daily_totals", "description": "same fields, new description",
+             "fields": [{"name": "day", "type": "string"}, {"name": "total", "type": "number"}],
+             "depends_on": ["orders"]},
+            {"id": "report", "description": "new",
+             "fields": [{"name": "id", "type": "string"}], "depends_on": ["orders"]}]},
+            ensure_ascii=False), encoding="utf-8")
+        run = subprocess.run(prefix + ["schema-diff", str(snapshot_path)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual(set(result), {"changes"})
+        self.assertEqual([row["id"] for row in result["changes"]], ["report"])
+        self.assertEqual(result["changes"][0]["added_fields"],
+                         [{"name": "id", "type": "string"}])
+        self.assertEqual(result["changes"][0]["removed_fields"], [])
+        self.assertEqual(result["changes"][0]["type_changes"], [])
+        self.assertIs(result["changes"][0]["breaking"], False)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+
+        removed = subprocess.run(prefix + ["schema-diff", str(ROOT / "samples" / "orders.json")],
+                                 capture_output=True, text=True)
+        self.assertEqual(removed.returncode, 2)
+        self.assertIn("error", json.loads(removed.stdout))
+
+        missing = subprocess.run(prefix + ["schema-diff", str(Path(self.temp.name) / "nope.json")],
+                                 capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stdout))
+
+        bad_json = Path(self.temp.name) / "bad.json"
+        bad_json.write_text("{not json", encoding="utf-8")
+        run = subprocess.run(prefix + ["schema-diff", str(bad_json)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+
+        invalid = Path(self.temp.name) / "invalid.json"
+        invalid.write_text(json.dumps({"datasets": [
+            {"id": "a", "fields": [{"name": "n", "type": "integer"}], "depends_on": ["a"]}]}),
+            encoding="utf-8")
+        run = subprocess.run(prefix + ["schema-diff", str(invalid)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+        self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+
+
 if __name__ == "__main__":
     unittest.main()
