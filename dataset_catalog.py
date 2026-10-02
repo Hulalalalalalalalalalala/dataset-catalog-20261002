@@ -407,6 +407,39 @@ class DatasetCatalog:
                 affected.append({"id": target, "causes": causes})
         return {"diff": diff, "affected": affected}
 
+    @staticmethod
+    def _schema_change_entry(identifier, before_fields, after_fields):
+        before_types = {field["name"]: field["type"] for field in before_fields}
+        after_types = {field["name"]: field["type"] for field in after_fields}
+        added = [{"name": name, "type": after_types[name]}
+                 for name in sorted(after_types.keys() - before_types.keys())]
+        removed = [{"name": name, "type": before_types[name]}
+                   for name in sorted(before_types.keys() - after_types.keys())]
+        type_changes = [{"name": name, "before": before_types[name], "after": after_types[name]}
+                        for name in sorted(before_types.keys() & after_types.keys())
+                        if before_types[name] != after_types[name]]
+        if not added and not removed and not type_changes:
+            return None
+        breaking = bool(removed) or any(
+            change["before"] != "integer" or change["after"] != "number"
+            for change in type_changes)
+        return {"id": identifier, "added_fields": added, "removed_fields": removed,
+                "type_changes": type_changes, "breaking": breaking}
+
+    def schema_diff_bundle(self, bundle):
+        snapshot = self._snapshot_state(bundle)
+        current = self._current_state()
+        changes = []
+        for key in sorted(set(current) | set(snapshot)):
+            before = current.get(key)
+            after = snapshot.get(key)
+            entry = self._schema_change_entry(key,
+                                              before["fields"] if before else [],
+                                              after["fields"] if after else [])
+            if entry is not None:
+                changes.append(entry)
+        return {"changes": changes}
+
     def _save_records(self, records):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = json.dumps(records, ensure_ascii=False, indent=2) + "\n"
@@ -446,6 +479,10 @@ def main():
     commands.add_parser("preview",
                         help="diff a snapshot bundle and preview the downstream impact of the change"
                         ).add_argument("file")
+    commands.add_parser("schema-diff",
+                        help="review field-level additions, removals and type changes "
+                             "between the catalog and a snapshot bundle"
+                        ).add_argument("file")
     apply_cmd = commands.add_parser("apply",
                                     help="apply a snapshot bundle as the complete catalog state")
     apply_cmd.add_argument("file")
@@ -475,6 +512,8 @@ def main():
             result = catalog.diff_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "preview":
             result = catalog.preview_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
+        elif args.command == "schema-diff":
+            result = catalog.schema_diff_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "apply":
             bundle = json.loads(Path(args.file).read_text(encoding="utf-8"))
             if args.expected is None:

@@ -1072,6 +1072,192 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("error", json.loads(run.stdout))
         self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
 
+    def test_schema_diff_reports_field_changes_sorted_by_id(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a", fields=[{"name": "keep", "type": "string"},
+                                               {"name": "drop", "type": "boolean"},
+                                               {"name": "widen", "type": "integer"},
+                                               {"name": "flip", "type": "string"}]),
+            self._snapshot_record("b", ["a"]),
+            self._snapshot_record("gone", ["b"])]})
+        bundle = {"datasets": [
+            self._snapshot_record("b", ["a"]),
+            self._snapshot_record("a", fields=[{"name": "flip", "type": "boolean"},
+                                               {"name": "keep", "type": "string"},
+                                               {"name": "widen", "type": "number"},
+                                               {"name": "new", "type": "integer"}]),
+            self._snapshot_record("fresh", ["a"],
+                                  fields=[{"name": "z", "type": "string"},
+                                          {"name": "m", "type": "number"}])]}
+        result = self.catalog.schema_diff_bundle(bundle)
+        self.assertEqual(set(result), {"changes"})
+        self.assertEqual([row["id"] for row in result["changes"]], ["a", "fresh", "gone"])
+        entry = result["changes"][0]
+        self.assertEqual(set(entry),
+                         {"id", "added_fields", "removed_fields", "type_changes", "breaking"})
+        self.assertEqual(entry["added_fields"], [{"name": "new", "type": "integer"}])
+        self.assertEqual(entry["removed_fields"], [{"name": "drop", "type": "boolean"}])
+        self.assertEqual(entry["type_changes"], [{"name": "flip", "before": "string",
+                                                  "after": "boolean"},
+                                                 {"name": "widen", "before": "integer",
+                                                  "after": "number"}])
+        self.assertTrue(entry["breaking"])
+        self.assertEqual(result["changes"][1],
+                         {"id": "fresh",
+                          "added_fields": [{"name": "m", "type": "number"},
+                                           {"name": "z", "type": "string"}],
+                          "removed_fields": [], "type_changes": [], "breaking": False})
+        self.assertEqual(result["changes"][2],
+                         {"id": "gone", "added_fields": [],
+                          "removed_fields": [{"name": "n", "type": "integer"}],
+                          "type_changes": [], "breaking": True})
+
+    def test_schema_diff_breaking_rules(self):
+        cases = [
+            ([{"name": "n", "type": "integer"}], [{"name": "n", "type": "number"}], False),
+            ([{"name": "n", "type": "number"}], [{"name": "n", "type": "integer"}], True),
+            ([{"name": "n", "type": "string"}], [{"name": "n", "type": "boolean"}], True),
+            ([{"name": "n", "type": "integer"}], [{"name": "n", "type": "integer"},
+                                                  {"name": "x", "type": "string"}], False),
+            ([{"name": "n", "type": "integer"}, {"name": "x", "type": "string"}],
+             [{"name": "n", "type": "integer"}], True),
+        ]
+        for index, (before_fields, after_fields, expected) in enumerate(cases):
+            other = Path(self.temp.name) / ("breaking-" + str(index) + ".json")
+            catalog = DatasetCatalog(other)
+            catalog.register(self._snapshot_record("a", fields=before_fields))
+            changes = catalog.schema_diff_bundle(
+                {"datasets": [self._snapshot_record("a", fields=after_fields)]})["changes"]
+            self.assertEqual(len(changes), 1)
+            self.assertEqual(changes[0]["breaking"], expected)
+
+    def test_schema_diff_ignores_metadata_and_field_order_changes(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a", tags=["x"], fields=[{"name": "n", "type": "integer"},
+                                                           {"name": "m", "type": "string"}]),
+            self._snapshot_record("b", ["a"])]})
+        bundle = {"datasets": [
+            self._snapshot_record("b", ["a"], description="rewritten"),
+            self._snapshot_record("a", tags=["y"], description="rewritten",
+                                  fields=[{"name": "m", "type": "string"},
+                                          {"name": "n", "type": "integer"}])]}
+        self.assertEqual(self.catalog.schema_diff_bundle(bundle), {"changes": []})
+        # plain diff still reports the field order change
+        self.assertEqual(self.catalog.diff_bundle(bundle)["changed"][0]["changed_keys"],
+                         ["description", "fields", "tags"])
+
+    def test_schema_diff_matches_field_names_exactly(self):
+        self.catalog.register(self._snapshot_record(
+            "a", fields=[{"name": "Name", "type": "string"}, {"name": " n", "type": "string"}]))
+        changes = self.catalog.schema_diff_bundle({"datasets": [self._snapshot_record(
+            "a", fields=[{"name": "name", "type": "string"}, {"name": "n", "type": "string"}])]
+        })["changes"]
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["added_fields"], [{"name": "n", "type": "string"},
+                                                      {"name": "name", "type": "string"}])
+        self.assertEqual(changes[0]["removed_fields"], [{"name": " n", "type": "string"},
+                                                        {"name": "Name", "type": "string"}])
+        self.assertEqual(changes[0]["type_changes"], [])
+        self.assertTrue(changes[0]["breaking"])
+
+    def test_schema_diff_empty_snapshot_and_missing_catalog(self):
+        self.assertFalse(self.path.exists())
+        result = self.catalog.schema_diff_bundle({"datasets": [self._snapshot_record("a")]})
+        self.assertEqual(result["changes"], [
+            {"id": "a", "added_fields": [{"name": "n", "type": "integer"}],
+             "removed_fields": [], "type_changes": [], "breaking": False}])
+        self.assertFalse(self.path.exists())
+        self.catalog.import_bundle({"datasets": [self._snapshot_record("a"),
+                                                 self._snapshot_record("b", ["a"])]})
+        result = self.catalog.schema_diff_bundle({"datasets": []})
+        self.assertEqual([row["id"] for row in result["changes"]], ["a", "b"])
+        self.assertTrue(all(row["breaking"] for row in result["changes"]))
+        self.path.write_text("{}", encoding="utf-8")
+        self.assertEqual(DatasetCatalog(self.path).schema_diff_bundle({"datasets": []}),
+                         {"changes": []})
+
+    def test_schema_diff_validates_both_sides_without_partial_results(self):
+        self.catalog.register(self._snapshot_record("old"))
+        for bundle in ({"datasets": [self._snapshot_record("a", ["ghost"])]},
+                       {"datasets": [self._snapshot_record("a", ["a"])]},
+                       {"datasets": [self._snapshot_record("a"), self._snapshot_record("a")]},
+                       {"datasets": [self._snapshot_record("a", ["b"]),
+                                     self._snapshot_record("b", ["a"])]},
+                       {"datasets": [{"id": "a", "fields": [{"name": "n", "type": "float"}]}]},
+                       {"datasets": None}, [], None):
+            with self.assertRaises(ValueError):
+                self.catalog.schema_diff_bundle(bundle)
+        # an invalid current catalog is rejected even when only metadata changed
+        self.path.write_text(json.dumps({"a": {"id": "a", "description": "d", "depends_on": ["a"],
+                                               "fields": [{"name": "n", "type": "integer"}]}}),
+                             encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.catalog.schema_diff_bundle({"datasets": [self._snapshot_record("a")]})
+
+    def test_schema_diff_does_not_mutate_inputs_or_write_files(self):
+        self.catalog.register(self._snapshot_record("a"))
+        catalog_before = self.path.read_text(encoding="utf-8")
+        bundle = {"datasets": [self._snapshot_record(
+            "a", fields=[{"name": "n", "type": "number"}, {"name": "x", "type": "string"}])]}
+        snapshot = json.loads(json.dumps(bundle))
+        result = self.catalog.schema_diff_bundle(bundle)
+        self.assertEqual(bundle, snapshot)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+        result["changes"][0]["added_fields"].append({"name": "tampered", "type": "string"})
+        again = self.catalog.schema_diff_bundle(bundle)
+        self.assertEqual(again["changes"][0]["added_fields"], [{"name": "x", "type": "string"}])
+
+        nested = Path(self.temp.name) / "state" / "nested" / "catalog.json"
+        self.assertEqual(DatasetCatalog(nested).schema_diff_bundle({"datasets": []}),
+                         {"changes": []})
+        self.assertFalse(nested.exists())
+        self.assertFalse(nested.parent.exists())
+
+    def test_cli_schema_diff_success_and_errors(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")],
+                       check=True, capture_output=True)
+        catalog_before = self.path.read_text(encoding="utf-8")
+
+        snapshot_path = Path(self.temp.name) / "snapshot.json"
+        snapshot_path.write_text(json.dumps({"datasets": [
+            {"id": "orders", "description": "Order amounts from the daily export",
+             "fields": [{"name": "order_id", "type": "string"},
+                        {"name": "amount", "type": "integer"},
+                        {"name": "channel", "type": "string"}], "depends_on": []}]},
+            ensure_ascii=False), encoding="utf-8")
+        run = subprocess.run(prefix + ["schema-diff", str(snapshot_path)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual(set(result), {"changes"})
+        self.assertEqual(result["changes"], [
+            {"id": "orders", "added_fields": [{"name": "channel", "type": "string"}],
+             "removed_fields": [],
+             "type_changes": [{"name": "amount", "before": "number", "after": "integer"}],
+             "breaking": True}])
+        self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+
+        missing = subprocess.run(prefix + ["schema-diff", str(Path(self.temp.name) / "nope.json")],
+                                 capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stdout))
+        bad_json = Path(self.temp.name) / "bad.json"
+        bad_json.write_text("{not json", encoding="utf-8")
+        run = subprocess.run(prefix + ["schema-diff", str(bad_json)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+        invalid = Path(self.temp.name) / "invalid.json"
+        invalid.write_text(json.dumps({"datasets": [
+            {"id": "a", "fields": [{"name": "n", "type": "integer"}], "depends_on": ["a"]}]}),
+            encoding="utf-8")
+        run = subprocess.run(prefix + ["schema-diff", str(invalid)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+        self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+
     def test_apply_commits_snapshot_and_returns_pre_commit_diff(self):
         self.catalog.import_bundle({"datasets": [
             self._snapshot_record("a"), self._snapshot_record("b"),

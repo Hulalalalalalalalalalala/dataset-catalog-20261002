@@ -30,4 +30,8 @@ new ids added, absent records removed) and prints the pre-commit
 {"added":[...],"removed":[...],"changed":[...]} diff; all-or-nothing, errors exit 2.
 Pass --expected FILE to require the current catalog to match that expected snapshot first;
 a mismatch prints {"error":"catalog does not match expected snapshot"} and exits 2.
+python3 dataset_catalog.py schema-diff FILE
+Prints {"changes":[...]} sorted by dataset id: only datasets whose fields changed, each with
+added_fields/removed_fields (name+type), type_changes (name/before/after) and a breaking flag
+(true on any removal or any type change other than integer->number); read-only, errors exit 2.
 python3 -B -m unittest -v
