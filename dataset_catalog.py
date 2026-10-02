@@ -332,6 +332,43 @@ class DatasetCatalog:
             result.append({"dataset": records[source], "targets": source_targets})
         return result
 
+    def between(self, source, target):
+        for endpoint in (source, target):
+            if not isinstance(endpoint, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", endpoint):
+                raise ValueError("invalid dataset id")
+        current = self._current_state()
+        if source not in current or target not in current:
+            raise ValueError("unknown dataset")
+        downstream = _downstream_index(current)
+        forward = {source}
+        frontier = {source}
+        while frontier:
+            discovered = set()
+            for node in frontier:
+                for child in downstream.get(node, ()):
+                    if child not in forward:
+                        forward.add(child)
+                        discovered.add(child)
+            frontier = discovered
+        backward = {target}
+        frontier = {target}
+        while frontier:
+            discovered = set()
+            for node in frontier:
+                for parent in current[node]["depends_on"]:
+                    if parent not in backward:
+                        backward.add(parent)
+                        discovered.add(parent)
+            frontier = discovered
+        on_path = forward & backward
+        edges = []
+        for key in sorted(on_path):
+            for parent in current[key]["depends_on"]:
+                if parent in on_path:
+                    edges.append({"source": parent, "target": key})
+        edges.sort(key=lambda edge: (edge["source"], edge["target"]))
+        return {"datasets": [current[key] for key in sorted(on_path)], "edges": edges}
+
     def export(self, identifiers=None):
         if identifiers is not None and not isinstance(identifiers, list):
             raise ValueError("identifiers must be None or a list of dataset ids")
@@ -629,6 +666,11 @@ def main():
         "common-upstream",
         help="find the common upstream datasets shared by repeated --id targets")
     common_upstream.add_argument("--id", action="append", dest="ids")
+    between = commands.add_parser(
+        "between",
+        help="list the datasets and edges on every dependency path from source to target")
+    between.add_argument("source")
+    between.add_argument("target")
     search = commands.add_parser("search")
     search.add_argument("query", nargs="?", default="")
     search.add_argument("--field-type", dest="field_type")
@@ -660,6 +702,8 @@ def main():
             result = catalog.export(None if args.ids is None else args.ids)
         elif args.command == "common-upstream":
             result = catalog.common_upstream([] if args.ids is None else args.ids)
+        elif args.command == "between":
+            result = catalog.between(args.source, args.target)
         elif args.command == "impact":
             result = catalog.impact(args.id, max_depth=_parse_max_depth(args.max_depth))
         elif args.command == "upstream":
