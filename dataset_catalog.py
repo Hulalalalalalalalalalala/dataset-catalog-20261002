@@ -15,19 +15,28 @@ class DatasetCatalog:
 
     def register(self, dataset):
         records = self.entries()
-        identifier = dataset["id"]
+        if not isinstance(dataset, dict):
+            raise ValueError("invalid dataset descriptor")
+        identifier = dataset.get("id")
         if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
             raise ValueError("invalid dataset id")
         if identifier in records:
             raise ValueError("dataset already registered")
-        fields = dataset["fields"]
+        fields = dataset.get("fields")
         if not isinstance(fields, list) or not fields:
             raise ValueError("at least one field is required")
-        names = [field["name"] for field in fields]
-        if any(not isinstance(name, str) or not name.strip() for name in names) or len(set(names)) != len(names):
-            raise ValueError("field names must be nonempty and unique")
-        if any(field["type"] not in ("string", "integer", "number", "boolean") for field in fields):
-            raise ValueError("unsupported field type")
+        names = []
+        for field in fields:
+            if not isinstance(field, dict) or "name" not in field or "type" not in field:
+                raise ValueError("invalid field descriptor")
+            name = field["name"]
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("field names must be nonempty strings")
+            if field["type"] not in ("string", "integer", "number", "boolean"):
+                raise ValueError("unsupported field type")
+            names.append(name)
+        if len(set(names)) != len(names):
+            raise ValueError("field names must be unique")
         dependencies = dataset.get("depends_on", [])
         if not isinstance(dependencies, list) or any(not isinstance(item, str) for item in dependencies):
             raise ValueError("depends_on must be a list of dataset ids")
