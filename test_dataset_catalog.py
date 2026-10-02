@@ -419,6 +419,156 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual([row["dataset"]["id"] for row in json.loads(run.stdout)], ["orders"])
 
+    def test_between_sample_orders_to_daily_totals(self):
+        result = DatasetCatalog(ROOT / "samples" / "catalog.json").between("orders", "daily_totals")
+        self.assertEqual(set(result), {"datasets", "edges"})
+        self.assertEqual([row["id"] for row in result["datasets"]], ["daily_totals", "orders"])
+        sample = DatasetCatalog(ROOT / "samples" / "catalog.json")
+        self.assertEqual({row["id"]: row for row in result["datasets"]},
+                         {"orders": sample.describe("orders"),
+                          "daily_totals": sample.describe("daily_totals")})
+        self.assertEqual(result["edges"], [{"source": "orders", "target": "daily_totals"}])
+
+    def test_between_collects_every_branch_and_length_as_nodes_and_edges(self):
+        self._write_records({
+            "s": self._record("s", []),
+            "a": self._record("a", ["s"]), "b": self._record("b", ["s"]),
+            "m": self._record("m", ["b"]),
+            "t": self._record("t", ["a", "m"]),
+            "side": self._record("side", ["s"]),
+            "lone": self._record("lone", [])})
+        result = self.catalog.between("s", "t")
+        self.assertEqual([row["id"] for row in result["datasets"]], ["a", "b", "m", "s", "t"])
+        self.assertEqual(result["edges"], [
+            {"source": "a", "target": "t"},
+            {"source": "b", "target": "m"},
+            {"source": "m", "target": "t"},
+            {"source": "s", "target": "a"},
+            {"source": "s", "target": "b"}])
+        self.assertEqual(result["datasets"][-1], self.catalog.describe("t"))
+        self.assertTrue(all(set(edge) == {"source", "target"} for edge in result["edges"]))
+
+    def test_between_same_endpoint_returns_record_without_edges(self):
+        self._write_records({"a": self._record("a", []), "b": self._record("b", ["a"])})
+        self.assertEqual(self.catalog.between("a", "a"),
+                         {"datasets": [self.catalog.describe("a")], "edges": []})
+        self.assertEqual(self.catalog.between("b", "b"),
+                         {"datasets": [self.catalog.describe("b")], "edges": []})
+
+    def test_between_unregistered_direction_and_unreachable_return_empty(self):
+        self._write_records({"a": self._record("a", []), "b": self._record("b", ["a"])})
+        self.assertEqual(self.catalog.between("b", "a"), {"datasets": [], "edges": []})
+        self._write_records({
+            "a": self._record("a", []), "b": self._record("b", ["a"]),
+            "c": self._record("c", []), "d": self._record("d", ["c"])})
+        self.assertEqual(self.catalog.between("a", "d"), {"datasets": [], "edges": []})
+
+    def test_between_independent_of_record_and_dependency_order(self):
+        records = {
+            "s": self._record("s", []),
+            "a": self._record("a", ["s"]), "b": self._record("b", ["s"]),
+            "t": self._record("t", ["a", "b"])}
+        self._write_records(records)
+        ids = ["a", "b", "s", "t"]
+        result = self.catalog.between("s", "t")
+        shuffled = {key: records[key] for key in reversed(list(records))}
+        shuffled["t"] = {**shuffled["t"], "depends_on": ["b", "a"]}
+        self._write_records(shuffled)
+        again = self.catalog.between("s", "t")
+        self.assertEqual([row["id"] for row in again["datasets"]],
+                         [row["id"] for row in result["datasets"]])
+        self.assertEqual(again["edges"], result["edges"])
+        self.assertEqual(sorted(row["id"] for row in again["datasets"]), ids)
+
+    def test_between_validates_arguments_before_reading_catalog(self):
+        self.assertFalse(self.path.exists())
+        missing = DatasetCatalog(self.path)
+        for bad in ((1, "a"), (None, "a"), (True, "a"), ("", "a"), ("A", "a"),
+                    ("a b", "a"), ("a", 1), ("a", None), ("a", True), ("a", "")):
+            with self.assertRaises(ValueError):
+                missing.between(*bad)
+        self.assertFalse(self.path.exists())
+        # well-formed but unregistered ids in a missing/empty catalog are unknown
+        with self.assertRaises(ValueError):
+            missing.between("a", "b")
+        self.assertFalse(self.path.exists())
+        self.path.write_text("{}", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            DatasetCatalog(self.path).between("a", "b")
+
+    def test_between_validates_the_whole_catalog_even_outside_the_chain(self):
+        good = {"s": self._record("s", []), "t": self._record("t", ["s"])}
+        bad_states = (
+            ["not", "an", "object"],
+            {**good, "other": {"id": "else", "fields": [{"name": "n", "type": "integer"}]}},
+            {**good, "other": "not a descriptor"},
+            {**good, "other": self._record("other", ["ghost"])},
+        )
+        for state in bad_states:
+            self._write_records(state)
+            with self.assertRaises(ValueError):
+                self.catalog.between("s", "t")
+        self._write_records({"s": {**self._record("s", []), "depends_on": ["t"]},
+                             "t": self._record("t", ["s"])})
+        with self.assertRaises(ValueError):
+            self.catalog.between("s", "t")
+        # a failure outside the chain still errors on an otherwise empty result
+        self._write_records({**good, "other": "not a descriptor"})
+        with self.assertRaises(ValueError):
+            self.catalog.between("t", "s")
+
+    def test_between_is_read_only(self):
+        self._write_records({
+            "s": self._record("s", []),
+            "a": self._record("a", ["s"]), "b": self._record("b", ["s"]),
+            "t": self._record("t", ["a", "b"])})
+        before = self.path.read_text(encoding="utf-8")
+        self.catalog.between("s", "t")
+        self.catalog.between("t", "s")
+        self.catalog.between("s", "s")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_cli_between(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")],
+                       check=True, capture_output=True)
+        subprocess.run(prefix + ["register", str(ROOT / "samples/daily.json")],
+                       check=True, capture_output=True)
+        run = subprocess.run(prefix + ["between", "orders", "daily_totals"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual([row["id"] for row in result["datasets"]], ["daily_totals", "orders"])
+        self.assertEqual(result["edges"], [{"source": "orders", "target": "daily_totals"}])
+        same = subprocess.run(prefix + ["between", "orders", "orders"],
+                              capture_output=True, text=True)
+        self.assertEqual(same.returncode, 0)
+        self.assertEqual([row["id"] for row in json.loads(same.stdout)["datasets"]], ["orders"])
+        self.assertEqual(json.loads(same.stdout)["edges"], [])
+        unreachable = subprocess.run(prefix + ["between", "daily_totals", "orders"],
+                                     capture_output=True, text=True)
+        self.assertEqual(unreachable.returncode, 0)
+        self.assertEqual(json.loads(unreachable.stdout), {"datasets": [], "edges": []})
+        before = self.path.read_text(encoding="utf-8")
+        missing_arg = subprocess.run(prefix + ["between", "orders"],
+                                     capture_output=True, text=True)
+        self.assertEqual(missing_arg.returncode, 2)
+        for bad_args in (["between", "Bad", "orders"],
+                         ["between", "orders", "nope"]):
+            failed = subprocess.run(prefix + bad_args, capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, bad_args)
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"}, bad_args)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_cli_between_uses_default_catalog(self):
+        base = [sys.executable, str(ROOT / "dataset_catalog.py")]
+        run = subprocess.run(base + ["between", "orders", "daily_totals"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual([row["id"] for row in result["datasets"]], ["daily_totals", "orders"])
+        self.assertEqual(result["edges"], [{"source": "orders", "target": "daily_totals"}])
+
     def test_cli_query_and_registration(self):
         prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
         run = subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")], capture_output=True, text=True)

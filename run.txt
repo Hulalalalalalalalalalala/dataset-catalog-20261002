@@ -21,6 +21,13 @@ Returns only orders: [{"dataset": orders record, "targets": [
 at least two distinct ids), sources sort by id and targets sort by id, a candidate another shared
 source depends on (even transitively) is omitted, independent common sources are all kept,
 and no shared source prints []; read-only, errors exit 2.
+python3 dataset_catalog.py between orders daily_totals
+Returns {"datasets":[orders record, daily_totals record],"edges":[{"source":"orders","target":"daily_totals"}]}:
+every node and edge on any directed SOURCE->TARGET path (all branches and path lengths, no path
+enumeration), datasets sorted by id and edges sorted by source then target; the same id for both
+ends returns that record and empty edges, registered but unreachable ends return two empty arrays,
+the whole catalog is validated even outside the chain (key/id mismatch included); read-only,
+errors exit 2.
 python3 dataset_catalog.py export --id daily_totals
 Returns {"datasets":[orders record, daily_totals record]}, dependencies first.
 python3 dataset_catalog.py search "daily amount"
