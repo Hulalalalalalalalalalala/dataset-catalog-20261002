@@ -27,6 +27,49 @@ def _normalize_tags(tags):
     return normalized
 
 
+def _normalize_descriptor(dataset, registered_ids, resolvable_ids):
+    """Validate and normalize one descriptor.
+
+    The id must not be in ``registered_ids``; every dependency must be in
+    ``resolvable_ids`` (which may additionally include ids still arriving in
+    the same batch).
+    """
+    if not isinstance(dataset, dict):
+        raise ValueError("invalid dataset descriptor")
+    identifier = dataset.get("id")
+    if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
+        raise ValueError("invalid dataset id")
+    if identifier in registered_ids:
+        raise ValueError("dataset already registered")
+    fields = dataset.get("fields")
+    if not isinstance(fields, list) or not fields:
+        raise ValueError("at least one field is required")
+    names = []
+    for field in fields:
+        if not isinstance(field, dict) or "name" not in field or "type" not in field:
+            raise ValueError("invalid field descriptor")
+        name = field["name"]
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("field names must be nonempty strings")
+        if field["type"] not in FIELD_TYPES:
+            raise ValueError("unsupported field type")
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise ValueError("field names must be unique")
+    dependencies = dataset.get("depends_on", [])
+    if not isinstance(dependencies, list) or any(not isinstance(item, str) for item in dependencies):
+        raise ValueError("depends_on must be a list of dataset ids")
+    if len(set(dependencies)) != len(dependencies) or any(item not in resolvable_ids
+                                                          for item in dependencies):
+        raise ValueError("dependencies must be unique, already registered dataset ids")
+    entry = {"id": identifier, "description": str(dataset.get("description", "")),
+             "fields": [{"name": field["name"], "type": field["type"]} for field in fields],
+             "depends_on": sorted(dependencies)}
+    if "tags" in dataset:
+        entry["tags"] = _normalize_tags(dataset["tags"])
+    return entry
+
+
 class DatasetCatalog:
     def __init__(self, path):
         self.path = Path(path)
@@ -36,48 +79,18 @@ class DatasetCatalog:
 
     def register(self, dataset):
         records = self.entries()
-        if not isinstance(dataset, dict):
-            raise ValueError("invalid dataset descriptor")
-        identifier = dataset.get("id")
-        if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
-            raise ValueError("invalid dataset id")
-        if identifier in records:
-            raise ValueError("dataset already registered")
-        fields = dataset.get("fields")
-        if not isinstance(fields, list) or not fields:
-            raise ValueError("at least one field is required")
-        names = []
-        for field in fields:
-            if not isinstance(field, dict) or "name" not in field or "type" not in field:
-                raise ValueError("invalid field descriptor")
-            name = field["name"]
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError("field names must be nonempty strings")
-            if field["type"] not in FIELD_TYPES:
-                raise ValueError("unsupported field type")
-            names.append(name)
-        if len(set(names)) != len(names):
-            raise ValueError("field names must be unique")
-        dependencies = dataset.get("depends_on", [])
-        if not isinstance(dependencies, list) or any(not isinstance(item, str) for item in dependencies):
-            raise ValueError("depends_on must be a list of dataset ids")
-        if len(set(dependencies)) != len(dependencies) or any(item not in records for item in dependencies):
-            raise ValueError("dependencies must be unique, already registered dataset ids")
-        entry = {"id": identifier, "description": str(dataset.get("description", "")),
-                 "fields": [{"name": field["name"], "type": field["type"]} for field in fields],
-                 "depends_on": sorted(dependencies)}
-        if "tags" in dataset:
-            entry["tags"] = _normalize_tags(dataset["tags"])
-        records[identifier] = entry
+        known = set(records)
+        entry = _normalize_descriptor(dataset, known, known)
+        records[entry["id"]] = entry
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return entry
 
     def describe(self, identifier):
-        records = self.entries()
-        if identifier not in records:
+        entry = self.entries().get(identifier)
+        if entry is None:
             raise ValueError("unknown dataset")
-        return records[identifier]
+        return entry
 
     def search(self, query="", field_type=None, tags=None):
         if not isinstance(query, str):
@@ -196,12 +209,64 @@ class DatasetCatalog:
             raise ValueError("dependency cycle detected")
         return {"datasets": [records[key] for key in ordered]}
 
+    def import_bundle(self, bundle):
+        if not isinstance(bundle, dict):
+            raise ValueError("bundle must be an object")
+        datasets = bundle.get("datasets")
+        if not isinstance(datasets, list):
+            raise ValueError("bundle must contain a datasets array")
+        records = self.entries()
+        registered = set(records)
+
+        batch_ids = []
+        seen_batch = set()
+        for dataset in datasets:
+            identifier = dataset.get("id") if isinstance(dataset, dict) else None
+            if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
+                raise ValueError("invalid dataset id")
+            if identifier in registered or identifier in seen_batch:
+                raise ValueError("dataset already registered")
+            seen_batch.add(identifier)
+            batch_ids.append(identifier)
+
+        resolvable = registered | seen_batch
+        new_entries = {}
+        for dataset in datasets:
+            entry = _normalize_descriptor(dataset, registered, resolvable)
+            new_entries[entry["id"]] = entry
+
+        remaining = {key: {dep for dep in new_entries[key]["depends_on"] if dep in seen_batch}
+                     for key in batch_ids}
+        ready = [key for key in batch_ids if not remaining[key]]
+        heapq.heapify(ready)
+        ordered = []
+        while ready:
+            key = heapq.heappop(ready)
+            ordered.append(key)
+            for other, deps in remaining.items():
+                if key in deps:
+                    deps.remove(key)
+                    if not deps:
+                        heapq.heappush(ready, other)
+        if len(ordered) != len(new_entries):
+            raise ValueError("dependency cycle detected")
+
+        added = [new_entries[key] for key in ordered]
+        if added:
+            for entry in added:
+                records[entry["id"]] = entry
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n",
+                                 encoding="utf-8")
+        return {"datasets": added}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--catalog", default="samples/catalog.json")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("register").add_argument("file")
+    commands.add_parser("import").add_argument("file")
     commands.add_parser("describe").add_argument("id")
     commands.add_parser("dependencies").add_argument("id")
     impact = commands.add_parser("impact")
@@ -218,6 +283,8 @@ def main():
         catalog = DatasetCatalog(args.catalog)
         if args.command == "register":
             result = catalog.register(json.loads(Path(args.file).read_text(encoding="utf-8")))
+        elif args.command == "import":
+            result = catalog.import_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "export":
             result = catalog.export(None if args.ids is None else args.ids)
         elif args.command == "impact":

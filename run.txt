@@ -11,8 +11,10 @@ python3 dataset_catalog.py dependencies daily_totals
 Returns orders as the only direct dependency.
 python3 dataset_catalog.py impact orders
 Returns daily_totals at distance 1 with path ["orders","daily_totals"].
-python3 dataset_catalog.py export --id daily_totals
+python3 dataset_catalog.py export --id daily_totals > /tmp/bundle.json
 Returns {"datasets":[orders record, daily_totals record]}, dependencies first.
+python3 dataset_catalog.py --catalog /tmp/rebuilt.json import /tmp/bundle.json
+Imports the bundle in one batch, printing only the newly added records in dependency order; failures exit 2 and leave the catalog untouched.
 python3 dataset_catalog.py search "daily amount"
 Returns only orders with matched_fields ["amount"]; search is read-only.
 python3 dataset_catalog.py search --field-type integer

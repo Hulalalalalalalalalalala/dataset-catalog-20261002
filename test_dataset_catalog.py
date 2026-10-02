@@ -439,6 +439,208 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(json.loads(run.stdout)["datasets"][0]["tags"], ["Finance", "日汇总"])
 
+    def _desc(self, identifier, depends_on=None, **extra):
+        descriptor = {"id": identifier,
+                      "description": identifier + " dataset",
+                      "fields": [{"name": "n", "type": "integer"}],
+                      "depends_on": depends_on or []}
+        descriptor.update(extra)
+        return descriptor
+
+    def test_import_orders_dependencies_first_independent_of_input_order(self):
+        shuffled = [self._desc("c", ["a", "b"]), self._desc("b", ["a"]), self._desc("a")]
+        expected = ["a", "b", "c"]
+        orders = (shuffled, list(reversed(shuffled)), [shuffled[1], shuffled[2], shuffled[0]])
+        for index, order in enumerate(orders):
+            path = self.path.parent / ("catalog-order-" + str(index) + ".json")
+            catalog = DatasetCatalog(path)
+            result = catalog.import_bundle({"datasets": order})
+            self.assertEqual([row["id"] for row in result["datasets"]], expected)
+            self.assertEqual([row["id"] for row in DatasetCatalog(path).export()["datasets"]],
+                             expected)
+
+    def test_import_breaks_ready_ties_by_lexicographic_id(self):
+        bundle = {"datasets": [self._desc("z"), self._desc("a"), self._desc("m"),
+                               self._desc("root", ["z", "a", "m"])]}
+        result = self.catalog.import_bundle(bundle)
+        self.assertEqual([row["id"] for row in result["datasets"]], ["a", "m", "z", "root"])
+
+    def test_import_resolves_batch_dependencies_in_any_position(self):
+        result = self.catalog.import_bundle({"datasets": [
+            self._desc("top", ["mid"]), self._desc("mid", ["base"]), self._desc("base")]})
+        self.assertEqual([row["id"] for row in result["datasets"]], ["base", "mid", "top"])
+        fresh = DatasetCatalog(self.path)
+        self.assertEqual([row["id"] for row in fresh.dependencies("top")], ["mid"])
+        self.assertEqual([row["id"] for row in fresh.dependencies("mid")], ["base"])
+
+    def test_import_mixes_existing_and_batch_dependencies(self):
+        self.catalog.register(self._desc("base"))
+        result = self.catalog.import_bundle({"datasets": [
+            self._desc("c", ["base", "a"]), self._desc("a", ["base"])]})
+        self.assertEqual([row["id"] for row in result["datasets"]], ["a", "c"])
+        fresh = DatasetCatalog(self.path)
+        self.assertEqual([row["id"] for row in fresh.dependencies("c")], ["a", "base"])
+        self.assertEqual({row["id"] for row in fresh.export()["datasets"]},
+                         {"a", "base", "c"})
+        self.assertEqual([row["dataset"]["id"] for row in fresh.impact("base")], ["a", "c"])
+        self.assertEqual([row["dataset"]["id"] for row in fresh.search("dataset")],
+                         ["a", "base", "c"])
+
+    def test_import_returns_only_newly_added_normalized_records(self):
+        self.catalog.register(self._desc("base", tags=["Base"]))
+        bundle = {"datasets": [self._desc("a", ["base"], description=5,
+                                          tags=[" Finance ", "finance"])],
+                  "ignored": "top-level key"}
+        result = self.catalog.import_bundle(bundle)
+        self.assertEqual(set(result), {"datasets"})
+        self.assertEqual([row["id"] for row in result["datasets"]], ["a"])
+        entry = result["datasets"][0]
+        self.assertEqual(entry, {"id": "a", "description": "5",
+                                 "fields": [{"name": "n", "type": "integer"}],
+                                 "depends_on": ["base"], "tags": ["Finance"]})
+
+    def test_import_distinguishes_missing_tags_from_empty_tags(self):
+        result = self.catalog.import_bundle({"datasets": [
+            {"id": "plain", "fields": [{"name": "n", "type": "integer"}], "depends_on": []},
+            {"id": "tagged", "fields": [{"name": "n", "type": "integer"}],
+             "depends_on": [], "tags": []}]})
+        records = {row["id"]: row for row in result["datasets"]}
+        self.assertNotIn("tags", records["plain"])
+        self.assertEqual(records["tagged"]["tags"], [])
+        fresh = DatasetCatalog(self.path)
+        self.assertNotIn("tags", fresh.describe("plain"))
+        self.assertEqual(fresh.describe("tagged")["tags"], [])
+
+    def test_import_empty_array_changes_nothing(self):
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.catalog.import_bundle({"datasets": []}), {"datasets": []})
+        self.assertFalse(self.path.exists())
+        self.catalog.register(self.raw)
+        before = self.path.read_text(encoding="utf-8")
+        self.assertEqual(self.catalog.import_bundle({"datasets": [], "extra": 1}),
+                         {"datasets": []})
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_import_rejects_bad_bundle_shapes(self):
+        for bad in ([], "x", 1, None, True, {"datasets": {}}, {"records": []}, {}):
+            with self.assertRaises(ValueError):
+                self.catalog.import_bundle(bad)
+        self.assertFalse(self.path.exists())
+
+    def test_import_rejects_duplicate_missing_self_and_cyclic_dependencies(self):
+        invalid_batches = [
+            [self._desc("a"), self._desc("a")],
+            [self._desc("a", ["ghost"])],
+            [self._desc("a", ["a"])],
+            [self._desc("a", ["b"]), self._desc("b", ["a"])],
+            [self._desc("a", ["b"]), self._desc("b", ["c"]), self._desc("c", ["a"])],
+        ]
+        for index, datasets in enumerate(invalid_batches):
+            path = self.path.parent / ("bad-" + str(index) + ".json")
+            with self.assertRaises(ValueError):
+                DatasetCatalog(path).import_bundle({"datasets": datasets})
+            self.assertFalse(path.exists())
+        self.catalog.register(self._desc("base"))
+        before = self.path.read_text(encoding="utf-8")
+        for datasets in invalid_batches + [[self._desc("base")]]:
+            with self.assertRaises(ValueError):
+                self.catalog.import_bundle({"datasets": datasets})
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_import_applies_register_field_and_tag_rules_without_overwrite(self):
+        self.catalog.register(self._desc("base"))
+        before = self.path.read_text(encoding="utf-8")
+        bad_batches = [
+            [{"id": "new", "fields": [{"name": "n", "type": "float"}], "depends_on": []}],
+            [{"id": "new", "fields": [{"name": "n", "type": "integer"},
+                                      {"name": "n", "type": "string"}], "depends_on": []}],
+            [{"id": "new", "fields": [{"name": "n", "type": "integer"}], "depends_on": ["x"]}],
+            [{"id": "new", "fields": [{"name": "n", "type": "integer"}],
+              "depends_on": ["base", "base"]}],
+            [{"id": "new", "fields": [{"name": "n", "type": "integer"}], "depends_on": [],
+              "tags": [""]}],
+            [{"id": "new", "fields": [{"name": "n", "type": "integer"}], "depends_on": [],
+              "tags": "x"}],
+            [self._desc("base")],
+            ["not-a-dict"],
+        ]
+        for datasets in bad_batches:
+            with self.assertRaises(ValueError):
+                self.catalog.import_bundle({"datasets": datasets})
+            self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_import_failure_leaves_existing_file_byte_identical(self):
+        self.catalog.register(self._desc("base"))
+        before = self.path.read_text(encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.catalog.import_bundle({"datasets": [self._desc("a", ["ghost"])]})
+        with self.assertRaises(ValueError):
+            self.catalog.import_bundle({"datasets": [self._desc("a"), self._desc("a")]})
+        with self.assertRaises(ValueError):
+            self.catalog.import_bundle({"datasets": [self._desc("a", ["b"]),
+                                                     self._desc("b", ["a"])]})
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+        self.assertEqual(DatasetCatalog(self.path).describe("base")["id"], "base")
+
+    def test_import_does_not_modify_input_object(self):
+        bundle = {"datasets": [self._desc("b", ["a"]), self._desc("a")], "kept": True}
+        snapshot = json.loads(json.dumps(bundle))
+        self.catalog.import_bundle(bundle)
+        self.assertEqual(bundle, snapshot)
+
+    def test_import_roundtrip_via_export(self):
+        sample = DatasetCatalog(ROOT / "samples" / "catalog.json")
+        bundle = sample.export(["daily_totals"])
+        result = self.catalog.import_bundle(json.loads(json.dumps(bundle)))
+        self.assertEqual([row["id"] for row in result["datasets"]], ["orders", "daily_totals"])
+        rebuilt = DatasetCatalog(self.path)
+        original = DatasetCatalog(ROOT / "samples" / "catalog.json")
+        for identifier in ("orders", "daily_totals"):
+            self.assertEqual(rebuilt.describe(identifier), original.describe(identifier))
+        self.assertEqual([row["id"] for row in rebuilt.dependencies("daily_totals")], ["orders"])
+
+    def test_cli_import(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        bundle_path = Path(self.temp.name) / "bundle.json"
+        bundle = {"datasets": [
+            {"id": "daily_totals", "description": "Daily totals derived from orders",
+             "fields": [{"name": "day", "type": "string"}, {"name": "total", "type": "number"}],
+             "depends_on": ["orders"]},
+            {"id": "orders", "description": "Order amounts from the daily export",
+             "fields": [{"name": "order_id", "type": "string"},
+                        {"name": "amount", "type": "number"}], "depends_on": []}]}
+        bundle_path.write_text(json.dumps(bundle, ensure_ascii=False), encoding="utf-8")
+        run = subprocess.run(prefix + ["import", str(bundle_path)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual([row["id"] for row in json.loads(run.stdout)["datasets"]],
+                         ["orders", "daily_totals"])
+        described = subprocess.run(prefix + ["describe", "daily_totals"],
+                                   capture_output=True, text=True)
+        self.assertEqual(json.loads(described.stdout)["depends_on"], ["orders"])
+
+        missing = subprocess.run(prefix + ["import", str(self.path.parent / "nope.json")],
+                                 capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stdout))
+
+        bad_json = Path(self.temp.name) / "bad.json"
+        bad_json.write_text("{not json", encoding="utf-8")
+        run = subprocess.run(prefix + ["import", str(bad_json)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+
+        invalid = Path(self.temp.name) / "invalid.json"
+        invalid.write_text(json.dumps({"datasets": [bundle["datasets"][1]]}), encoding="utf-8")
+        run = subprocess.run(prefix + ["import", str(invalid)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+
+        empty = Path(self.temp.name) / "empty.json"
+        empty.write_text(json.dumps({"datasets": []}), encoding="utf-8")
+        run = subprocess.run(prefix + ["import", str(empty)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0)
+        self.assertEqual(json.loads(run.stdout), {"datasets": []})
+
 
 if __name__ == "__main__":
     unittest.main()
