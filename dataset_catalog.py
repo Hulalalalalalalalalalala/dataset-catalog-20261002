@@ -28,6 +28,15 @@ def _normalize_tags(tags):
     return normalized
 
 
+def _normalize_owner(owner):
+    if not isinstance(owner, str):
+        raise ValueError("owner must be a string")
+    cleaned = owner.strip()
+    if not cleaned:
+        raise ValueError("owner must be a nonempty string")
+    return cleaned
+
+
 def _normalized_record(dataset, known_ids):
     if not isinstance(dataset, dict):
         raise ValueError("invalid dataset descriptor")
@@ -59,6 +68,8 @@ def _normalized_record(dataset, known_ids):
              "depends_on": sorted(dependencies)}
     if "tags" in dataset:
         entry["tags"] = _normalize_tags(dataset["tags"])
+    if "owner" in dataset:
+        entry["owner"] = _normalize_owner(dataset["owner"])
     return entry
 
 
@@ -138,12 +149,13 @@ class DatasetCatalog:
             raise ValueError("unknown dataset")
         return records[identifier]
 
-    def search(self, query="", field_type=None, tags=None):
+    def search(self, query="", field_type=None, tags=None, owner=None):
         if not isinstance(query, str):
             raise ValueError("query must be a string")
         if field_type is not None and field_type not in FIELD_TYPES:
             raise ValueError("field_type must be None or one of string, integer, number, boolean")
         required_tags = _normalize_tags(tags) if tags is not None else []
+        required_owner = _normalize_owner(owner).casefold() if owner is not None else None
         words = {word.casefold() for word in query.split()}
         records = self.entries()
         results = []
@@ -154,6 +166,10 @@ class DatasetCatalog:
             if required_tags:
                 available = {tag.casefold() for tag in entry.get("tags", [])}
                 if not all(tag.casefold() in available for tag in required_tags):
+                    continue
+            if required_owner is not None:
+                entry_owner = entry.get("owner")
+                if not isinstance(entry_owner, str) or entry_owner.casefold() != required_owner:
                     continue
             matched_indices = set()
             matched = True
@@ -407,6 +423,7 @@ def main():
     search.add_argument("query", nargs="?", default="")
     search.add_argument("--field-type", dest="field_type")
     search.add_argument("--tag", action="append", dest="tags")
+    search.add_argument("--owner", dest="owner")
     args = parser.parse_args()
     try:
         catalog = DatasetCatalog(args.catalog)
@@ -430,7 +447,7 @@ def main():
                 max_depth = None
             result = catalog.impact(args.id, max_depth=max_depth)
         elif args.command == "search":
-            result = catalog.search(args.query, args.field_type, args.tags)
+            result = catalog.search(args.query, args.field_type, args.tags, args.owner)
         else:
             result = getattr(catalog, args.command)(args.id)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
