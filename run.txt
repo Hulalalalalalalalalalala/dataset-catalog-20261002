@@ -17,4 +17,7 @@ python3 dataset_catalog.py search "daily amount"
 Returns only orders with matched_fields ["amount"]; search is read-only.
 python3 dataset_catalog.py search --field-type integer
 Lists datasets having an integer field; an omitted query means no keyword restriction.
+python3 dataset_catalog.py diff FILE
+Compares the catalog (before) with a {"datasets":[...]} snapshot file (after, treated as complete)
+and prints {"added":[...],"removed":[...],"changed":[...]} sorted by id; read-only, errors exit 2.
 python3 -B -m unittest -v

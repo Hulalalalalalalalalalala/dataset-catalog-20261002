@@ -1,5 +1,6 @@
 """Register dataset schemas and inspect their direct dependencies."""
 import argparse
+import copy
 import heapq
 import json
 import re
@@ -27,6 +28,56 @@ def _normalize_tags(tags):
     return normalized
 
 
+def _normalized_record(dataset, known_ids):
+    if not isinstance(dataset, dict):
+        raise ValueError("invalid dataset descriptor")
+    identifier = dataset.get("id")
+    if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
+        raise ValueError("invalid dataset id")
+    fields = dataset.get("fields")
+    if not isinstance(fields, list) or not fields:
+        raise ValueError("at least one field is required")
+    names = []
+    for field in fields:
+        if not isinstance(field, dict) or "name" not in field or "type" not in field:
+            raise ValueError("invalid field descriptor")
+        name = field["name"]
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("field names must be nonempty strings")
+        if field["type"] not in FIELD_TYPES:
+            raise ValueError("unsupported field type")
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise ValueError("field names must be unique")
+    dependencies = dataset.get("depends_on", [])
+    if not isinstance(dependencies, list) or any(not isinstance(item, str) for item in dependencies):
+        raise ValueError("depends_on must be a list of dataset ids")
+    if len(set(dependencies)) != len(dependencies) or any(item not in known_ids for item in dependencies):
+        raise ValueError("dependencies must be unique, already registered dataset ids")
+    entry = {"id": identifier, "description": str(dataset.get("description", "")),
+             "fields": [{"name": field["name"], "type": field["type"]} for field in fields],
+             "depends_on": sorted(dependencies)}
+    if "tags" in dataset:
+        entry["tags"] = _normalize_tags(dataset["tags"])
+    return entry
+
+
+def _toposort(entries):
+    remaining = {key: set(entry["depends_on"]) for key, entry in entries.items()}
+    ready = [key for key, deps in remaining.items() if not deps]
+    heapq.heapify(ready)
+    ordered = []
+    while ready:
+        key = heapq.heappop(ready)
+        ordered.append(key)
+        for other, deps in remaining.items():
+            if key in deps:
+                deps.remove(key)
+                if not deps:
+                    heapq.heappush(ready, other)
+    return ordered if len(ordered) == len(entries) else None
+
+
 class DatasetCatalog:
     def __init__(self, path):
         self.path = Path(path)
@@ -35,37 +86,7 @@ class DatasetCatalog:
         return json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
 
     def _normalize_entry(self, dataset, known_ids):
-        if not isinstance(dataset, dict):
-            raise ValueError("invalid dataset descriptor")
-        identifier = dataset.get("id")
-        if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
-            raise ValueError("invalid dataset id")
-        fields = dataset.get("fields")
-        if not isinstance(fields, list) or not fields:
-            raise ValueError("at least one field is required")
-        names = []
-        for field in fields:
-            if not isinstance(field, dict) or "name" not in field or "type" not in field:
-                raise ValueError("invalid field descriptor")
-            name = field["name"]
-            if not isinstance(name, str) or not name.strip():
-                raise ValueError("field names must be nonempty strings")
-            if field["type"] not in FIELD_TYPES:
-                raise ValueError("unsupported field type")
-            names.append(name)
-        if len(set(names)) != len(names):
-            raise ValueError("field names must be unique")
-        dependencies = dataset.get("depends_on", [])
-        if not isinstance(dependencies, list) or any(not isinstance(item, str) for item in dependencies):
-            raise ValueError("depends_on must be a list of dataset ids")
-        if len(set(dependencies)) != len(dependencies) or any(item not in known_ids for item in dependencies):
-            raise ValueError("dependencies must be unique, already registered dataset ids")
-        entry = {"id": identifier, "description": str(dataset.get("description", "")),
-                 "fields": [{"name": field["name"], "type": field["type"]} for field in fields],
-                 "depends_on": sorted(dependencies)}
-        if "tags" in dataset:
-            entry["tags"] = _normalize_tags(dataset["tags"])
-        return entry
+        return _normalized_record(dataset, known_ids)
 
     def register(self, dataset):
         records = self.entries()
@@ -189,19 +210,9 @@ class DatasetCatalog:
                 if source not in included:
                     stack.append(source)
 
-        remaining = {key: set(records[key]["depends_on"]) for key in included}
-        ready = [key for key, deps in remaining.items() if not deps]
-        heapq.heapify(ready)
-        ordered = []
-        while ready:
-            key = heapq.heappop(ready)
-            ordered.append(key)
-            for other, deps in remaining.items():
-                if key in deps:
-                    deps.remove(key)
-                    if not deps:
-                        heapq.heappush(ready, other)
-        if len(ordered) != len(included):
+        subset = {key: records[key] for key in included}
+        ordered = _toposort(subset)
+        if ordered is None:
             raise ValueError("dependency cycle detected")
         return {"datasets": [records[key] for key in ordered]}
 
@@ -232,20 +243,10 @@ class DatasetCatalog:
                 raise ValueError("dependencies must be unique, already registered dataset ids")
             new_entries[entry["id"]] = entry
 
-        remaining = {key: set(entry["depends_on"]) & batch_ids
-                     for key, entry in new_entries.items()}
-        ready = [key for key, deps in remaining.items() if not deps]
-        heapq.heapify(ready)
-        ordered = []
-        while ready:
-            key = heapq.heappop(ready)
-            ordered.append(key)
-            for other, deps in remaining.items():
-                if key in deps:
-                    deps.remove(key)
-                    if not deps:
-                        heapq.heappush(ready, other)
-        if len(ordered) != len(new_entries):
+        batch = {key: {"depends_on": [dep for dep in entry["depends_on"] if dep in batch_ids]}
+                 for key, entry in new_entries.items()}
+        ordered = _toposort(batch)
+        if ordered is None:
             raise ValueError("dependency cycle detected")
 
         imported = [new_entries[key] for key in ordered]
@@ -257,6 +258,52 @@ class DatasetCatalog:
                                  encoding="utf-8")
         return {"datasets": imported}
 
+    def diff_bundle(self, bundle):
+        if not isinstance(bundle, dict):
+            raise ValueError("bundle must be an object")
+        descriptors = bundle.get("datasets")
+        if not isinstance(descriptors, list):
+            raise ValueError("bundle must contain a datasets array")
+
+        snapshot_ids = set()
+        for dataset in descriptors:
+            if not isinstance(dataset, dict):
+                raise ValueError("invalid dataset descriptor")
+            identifier = dataset.get("id")
+            if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
+                raise ValueError("invalid dataset id")
+            if identifier in snapshot_ids:
+                raise ValueError("dataset already registered")
+            snapshot_ids.add(identifier)
+
+        snapshot = {}
+        for dataset in descriptors:
+            entry = _normalized_record(dataset, snapshot_ids)
+            if entry["id"] in entry["depends_on"]:
+                raise ValueError("dependencies must be unique, already registered dataset ids")
+            snapshot[entry["id"]] = entry
+        if _toposort(snapshot) is None:
+            raise ValueError("dependency cycle detected")
+
+        records = self.entries()
+        current = {key: _normalized_record(entry, set(records))
+                   for key, entry in records.items()}
+
+        before_ids = set(current)
+        after_ids = set(snapshot)
+        added = [copy.deepcopy(snapshot[key]) for key in sorted(after_ids - before_ids)]
+        removed = [copy.deepcopy(current[key]) for key in sorted(before_ids - after_ids)]
+        changed = []
+        for key in sorted(before_ids & after_ids):
+            before = current[key]
+            after = snapshot[key]
+            changed_keys = sorted(name for name in set(before) | set(after)
+                                  if before.get(name) != after.get(name))
+            if changed_keys:
+                changed.append({"id": key, "before": copy.deepcopy(before),
+                                "after": copy.deepcopy(after), "changed_keys": changed_keys})
+        return {"added": added, "removed": removed, "changed": changed}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -264,6 +311,7 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("register").add_argument("file")
     commands.add_parser("import", help="import a bundle of dataset metadata").add_argument("file")
+    commands.add_parser("diff", help="compare the catalog with a read-only snapshot bundle").add_argument("file")
     commands.add_parser("describe").add_argument("id")
     commands.add_parser("dependencies").add_argument("id")
     impact = commands.add_parser("impact")
@@ -282,6 +330,8 @@ def main():
             result = catalog.register(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "import":
             result = catalog.import_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
+        elif args.command == "diff":
+            result = catalog.diff_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "export":
             result = catalog.export(None if args.ids is None else args.ids)
         elif args.command == "impact":
