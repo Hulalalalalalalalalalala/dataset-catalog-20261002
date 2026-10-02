@@ -2495,5 +2495,283 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
 
 
+class ExportCsvTests(unittest.TestCase):
+    HEADER = "dataset_id,description,owner,tags,depends_on,field_name,field_type\n"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "catalog.json"
+        self.catalog = DatasetCatalog(self.path)
+
+    def _write_records(self, records):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+
+    def _record(self, identifier, depends_on=None, fields=None, **extra):
+        record = {"id": identifier, "description": identifier + " description",
+                  "fields": fields or [{"name": "n", "type": "integer"}],
+                  "depends_on": depends_on or []}
+        record.update(extra)
+        return record
+
+    def _chain(self):
+        self._write_records({
+            "orders": self._record("orders", fields=[
+                {"name": "order_id", "type": "string"},
+                {"name": "amount", "type": "number"}],
+                owner="Alice", tags=["Finance", "日汇总"]),
+            "daily_totals": self._record("daily_totals", ["orders"],
+                                         fields=[{"name": "day", "type": "string"},
+                                                 {"name": "total", "type": "number"}]),
+            "weekly": self._record("weekly", ["daily_totals"]),
+            "report": self._record("report", ["orders"]),
+        })
+
+    def test_csv_header_and_rows_for_full_catalog(self):
+        self._chain()
+        text = self.catalog.export_csv()
+        self.assertEqual(text.splitlines()[0], self.HEADER.rstrip("\n"))
+        self.assertTrue(text.endswith("\n"))
+        lines = text.split("\n")
+        self.assertEqual(lines[-1], "")
+        rows = lines[:-1]
+        # orders(2 fields) + daily_totals(2) + weekly(1) + report(1) plus the header
+        self.assertEqual(len(rows), 7)
+        self.assertEqual(rows[1],
+                         "orders,orders description,Alice,"
+                         '"[""Finance"",""日汇总""]",[],order_id,string')
+        self.assertEqual(rows[2],
+                         "orders,orders description,Alice,"
+                         '"[""Finance"",""日汇总""]",[],amount,number')
+        self.assertEqual(rows[3],
+                         'daily_totals,daily_totals description,,[],"[""orders""]",day,string')
+        self.assertEqual(rows[4],
+                         'daily_totals,daily_totals description,,[],"[""orders""]",total,number')
+
+    def test_csv_dependency_ordering_and_field_registration_order(self):
+        self._chain()
+        text = self.catalog.export_csv()
+        ids = [line.split(",", 1)[0] for line in text.splitlines()[1:]]
+        self.assertEqual(ids, ["orders", "orders", "daily_totals", "daily_totals",
+                               "report", "weekly"])
+        self.assertEqual([line.rsplit(",", 2)[1] for line in text.splitlines()[1:3]],
+                         ["order_id", "amount"])
+
+    def test_csv_selection_closure_duplicates_and_order_independence(self):
+        self._chain()
+        first = self.catalog.export_csv(["weekly", "report", "weekly"])
+        second = self.catalog.export_csv(["report", "weekly"])
+        self.assertEqual(first, second)
+        ids = []
+        for line in first.splitlines()[1:]:
+            identifier = line.split(",", 1)[0]
+            if not ids or ids[-1] != identifier:
+                ids.append(identifier)
+        self.assertEqual(ids, ["orders", "daily_totals", "report", "weekly"])
+        only_daily = self.catalog.export_csv(["daily_totals"])
+        self.assertEqual(
+            [line.split(",", 1)[0] for line in only_daily.splitlines()[1:]],
+            ["orders", "orders", "daily_totals", "daily_totals"])
+        only_orders = self.catalog.export_csv(["orders"]).splitlines()[1:]
+        self.assertEqual(len(only_orders), 2)
+        self.assertTrue(all(line.startswith('orders,orders description,') for line in only_orders))
+
+    def test_csv_empty_selection_and_missing_catalog_emit_header_only(self):
+        self._chain()
+        self.assertEqual(self.catalog.export_csv([]), self.HEADER)
+        missing_path = Path(self.temp.name) / "absent" / "catalog.json"
+        missing = DatasetCatalog(missing_path)
+        self.assertFalse(missing_path.exists())
+        self.assertEqual(missing.export_csv(), self.HEADER)
+        self.assertEqual(missing.export_csv([]), self.HEADER)
+        self.assertFalse(missing_path.exists())
+        self.path.write_text("{}", encoding="utf-8")
+        self.assertEqual(DatasetCatalog(self.path).export_csv(), self.HEADER)
+
+    def test_csv_missing_owner_and_tags_render_empty_cell_and_empty_array(self):
+        self._write_records({"a": self._record("a", tags=[]),
+                             "b": self._record("b")})
+        text = self.catalog.export_csv()
+        self.assertEqual(text.splitlines()[1:],
+                         ["a,a description,,[],[],n,integer",
+                          "b,b description,,[],[],n,integer"])
+
+    def test_csv_dependencies_sorted_and_tags_keep_order_as_compact_chinese_json(self):
+        self._write_records({
+            "a": self._record("a"),
+            "b": self._record("b"),
+            "c": self._record("c", ["b", "a"], tags=[" 财务 ", "finance", "FINANCE"]),
+        })
+        rows = self.catalog.export_csv().splitlines()
+        self.assertEqual(rows[-1],
+                         'c,c description,,"[""财务"",""finance""]","[""a"",""b""]",n,integer')
+
+    def test_csv_quotes_cells_with_commas_quotes_and_newlines(self):
+        self._write_records({
+            "a": {"id": "a", "description": "one, two \"q\"\nsecond line",
+                  "fields": [{"name": "weird,name", "type": "integer"},
+                             {"name": 'quo"ted', "type": "string"},
+                             {"name": "line\nbreak", "type": "number"}],
+                  "depends_on": []}
+        })
+        text = self.catalog.export_csv()
+        quoted_description = '"one, two ""q""\nsecond line"'
+        prefix = "a," + quoted_description + ",,[],[],"
+        expected = self.HEADER
+        expected += prefix + '"weird,name",integer\n'
+        expected += prefix + '"quo""ted",string\n'
+        expected += prefix + '"line\nbreak",number\n'
+        self.assertEqual(text, expected)
+
+    def test_csv_is_parseable_with_the_csv_module(self):
+        import csv as csv_module
+        import io
+        self._write_records({
+            "a": {"id": "a", "description": "one, two\nline",
+                  "fields": [{"name": "x,y", "type": "string"}],
+                  "depends_on": [], "tags": ["标签", "b"]}
+        })
+        rows = list(csv_module.reader(io.StringIO(self.catalog.export_csv())))
+        self.assertEqual(rows[0], ["dataset_id", "description", "owner", "tags",
+                                   "depends_on", "field_name", "field_type"])
+        self.assertEqual(rows[1], ["a", "one, two\nline", "", '["标签","b"]', "[]",
+                                   "x,y", "string"])
+
+    def test_csv_validates_arguments_before_reading_catalog(self):
+        self.assertFalse(self.path.exists())
+        missing = DatasetCatalog(self.path)
+        for bad in ("orders", ("orders",), {1}, True, 1):
+            with self.assertRaises(ValueError):
+                missing.export_csv(bad)
+        for bad in ([""], ["Orders"], ["ord ers"], [1], [None], [True], ["orders", ""]):
+            with self.assertRaises(ValueError):
+                missing.export_csv(bad)
+        self.assertFalse(self.path.exists())
+        with self.assertRaises(ValueError):
+            missing.export_csv(["orders"])
+        self.assertFalse(self.path.exists())
+
+    def test_csv_rejects_non_object_top_level(self):
+        self.path.write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.catalog.export_csv()
+        with self.assertRaises(ValueError):
+            self.catalog.export_csv(["a"])
+
+    def test_csv_validates_selected_closure_but_ignores_outside_records(self):
+        bad_states = (
+            {"top": {"id": "other", "fields": [{"name": "n", "type": "integer"}]}},
+            {"top": {"id": "top", "fields": [{"name": "n", "type": "float"}]}},
+            {"top": {"id": "top", "fields": [{"name": "n", "type": "integer"}],
+                     "depends_on": ["top"]}},
+            {"top": {"id": "top", "fields": [{"name": "n", "type": "integer"}],
+                     "depends_on": ["mid", "mid"]},
+             "mid": {"id": "mid", "fields": [{"name": "n", "type": "integer"}]}},
+            {"top": {"id": "top", "fields": [{"name": "n", "type": "integer"}],
+                     "depends_on": ["ghost"]}},
+            {"top": {"id": "top", "fields": [{"name": "n", "type": "integer"}],
+                     "depends_on": ["mid"]},
+             "mid": {"id": "mid", "fields": [{"name": "n", "type": "integer"}],
+                     "depends_on": ["top"]}},
+        )
+        for state in bad_states:
+            self._write_records(state)
+            with self.assertRaises(ValueError):
+                self.catalog.export_csv(["top"])
+            with self.assertRaises(ValueError):
+                self.catalog.export_csv()
+        # corruption outside the selected closure does not participate in validation
+        self._write_records({
+            "base": self._record("base"),
+            "top": self._record("top", ["base"]),
+            "corrupt": "not a descriptor",
+            "cyclic": {"id": "cyclic", "fields": [{"name": "n", "type": "integer"}],
+                       "depends_on": ["cyclic"]},
+        })
+        rows = self.catalog.export_csv(["top"]).splitlines()
+        self.assertEqual([line.split(",", 1)[0] for line in rows[1:]], ["base", "top"])
+        with self.assertRaises(ValueError):
+            self.catalog.export_csv()
+
+    def test_csv_unreadable_file_raises_oserror_and_bad_json_raises_decode_error(self):
+        with self.assertRaises(OSError):
+            DatasetCatalog(Path(self.temp.name)).export_csv()
+        self.path.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(json.JSONDecodeError):
+            self.catalog.export_csv()
+
+    def test_csv_is_read_only(self):
+        self._chain()
+        before = self.path.read_text(encoding="utf-8")
+        self.catalog.export_csv()
+        self.catalog.export_csv(["weekly", "report"])
+        self.catalog.export_csv([])
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_cli_export_csv(self):
+        base = [sys.executable, str(ROOT / "dataset_catalog.py")]
+        ok = subprocess.run(base + ["export-csv", "--id", "daily_totals"],
+                            capture_output=True, text=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        expected = (
+            "dataset_id,description,owner,tags,depends_on,field_name,field_type\n"
+            "orders,Order amounts from the daily export,,[],[],order_id,string\n"
+            "orders,Order amounts from the daily export,,[],[],amount,number\n"
+            'daily_totals,Daily totals derived from orders,,[],"[""orders""]",day,string\n'
+            'daily_totals,Daily totals derived from orders,,[],"[""orders""]",total,number\n')
+        self.assertEqual(ok.stdout, expected)
+        full = subprocess.run(base + ["export-csv"], capture_output=True, text=True)
+        self.assertEqual(full.returncode, 0, full.stderr)
+        self.assertEqual(full.stdout.splitlines()[0],
+                         "dataset_id,description,owner,tags,depends_on,field_name,field_type")
+        repeated = subprocess.run(base + ["export-csv", "--id", "daily_totals",
+                                          "--id", "orders", "--id", "daily_totals"],
+                                  capture_output=True, text=True)
+        self.assertEqual(repeated.stdout, ok.stdout)
+
+    def test_cli_export_csv_failures_print_only_error_json_exit_2(self):
+        custom = [sys.executable, str(ROOT / "dataset_catalog.py"),
+                  "--catalog", str(self.path)]
+        missing = subprocess.run(custom + ["export-csv", "--id", "nope"],
+                                 capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertEqual(set(json.loads(missing.stdout)), {"error"})
+        bad_id = subprocess.run(custom + ["export-csv", "--id", "Bad"],
+                                capture_output=True, text=True)
+        self.assertEqual(bad_id.returncode, 2)
+        self.assertEqual(set(json.loads(bad_id.stdout)), {"error"})
+        # empty/missing catalog still succeeds with the terminated header only
+        ok = subprocess.run(custom + ["export-csv"], capture_output=True, text=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(ok.stdout,
+                         "dataset_id,description,owner,tags,depends_on,field_name,field_type\n")
+        self.path.write_text('["not", "an", "object"]', encoding="utf-8")
+        bad_state = subprocess.run(custom + ["export-csv"], capture_output=True, text=True)
+        self.assertEqual(bad_state.returncode, 2)
+        self.assertEqual(set(json.loads(bad_state.stdout)), {"error"})
+        self.path.write_text("{not json", encoding="utf-8")
+        bad_json = subprocess.run(custom + ["export-csv"], capture_output=True, text=True)
+        self.assertEqual(bad_json.returncode, 2)
+        self.assertEqual(set(json.loads(bad_json.stdout)), {"error"})
+        directory = subprocess.run(
+            [sys.executable, str(ROOT / "dataset_catalog.py"),
+             "--catalog", str(self.temp.name), "export-csv"],
+            capture_output=True, text=True)
+        self.assertEqual(directory.returncode, 2)
+        self.assertEqual(set(json.loads(directory.stdout)), {"error"})
+
+    def test_cli_export_csv_does_not_modify_catalog(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")],
+                       check=True, capture_output=True)
+        subprocess.run(prefix + ["register", str(ROOT / "samples/daily.json")],
+                       check=True, capture_output=True)
+        before = self.path.read_text(encoding="utf-8")
+        run = subprocess.run(prefix + ["export-csv"], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+
 if __name__ == "__main__":
     unittest.main()

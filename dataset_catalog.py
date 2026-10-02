@@ -5,6 +5,7 @@ import heapq
 import json
 import os
 import re
+import sys
 import tempfile
 from pathlib import Path
 
@@ -158,6 +159,21 @@ def _validated_upstream_closure(records, start):
     if _toposort(closure) is None:
         raise ValueError("dependency cycle detected")
     return closure
+
+
+def _csv_cell(value):
+    text = "" if value is None else str(value)
+    if any(character in text for character in (",", '"', "\n")):
+        text = '"' + text.replace('"', '""') + '"'
+    return text
+
+
+def _csv_row(values):
+    return ",".join(_csv_cell(value) for value in values) + "\n"
+
+
+CSV_HEADER = ("dataset_id", "description", "owner", "tags", "depends_on",
+              "field_name", "field_type")
 
 
 class DatasetCatalog:
@@ -407,6 +423,52 @@ class DatasetCatalog:
         if ordered is None:
             raise ValueError("dependency cycle detected")
         return {"datasets": [records[key] for key in ordered]}
+
+    def export_csv(self, identifiers=None):
+        if identifiers is not None and not isinstance(identifiers, list):
+            raise ValueError("identifiers must be None or a list of dataset ids")
+        selected = []
+        if identifiers is not None:
+            for item in identifiers:
+                if not isinstance(item, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", item):
+                    raise ValueError("invalid dataset id")
+                if item not in selected:
+                    selected.append(item)
+        records = self.entries()
+        if not isinstance(records, dict):
+            raise ValueError("invalid catalog state")
+        unknown = [item for item in selected if item not in records]
+        if unknown:
+            raise ValueError("unknown dataset")
+
+        closure = {}
+        stack = list(records) if identifiers is None else selected
+        while stack:
+            key = stack.pop()
+            if key in closure:
+                continue
+            entry = _normalized_record(records[key], set(records))
+            if entry["id"] != key:
+                raise ValueError("invalid dataset descriptor")
+            if entry["id"] in entry["depends_on"]:
+                raise ValueError("dependencies must be unique, already registered dataset ids")
+            closure[key] = entry
+            stack.extend(entry["depends_on"])
+        ordered = _toposort(closure)
+        if ordered is None:
+            raise ValueError("dependency cycle detected")
+
+        lines = [_csv_row(CSV_HEADER)]
+        for key in ordered:
+            entry = closure[key]
+            tags = json.dumps(entry.get("tags", []), ensure_ascii=False, separators=(",", ":"))
+            depends_on = json.dumps(entry["depends_on"], ensure_ascii=False,
+                                    separators=(",", ":"))
+            for field in entry["fields"]:
+                lines.append(_csv_row([
+                    entry["id"], entry["description"], entry.get("owner"), tags, depends_on,
+                    field["name"], field["type"]]))
+        return "".join(lines)
 
     def import_bundle(self, bundle):
         if not isinstance(bundle, dict):
@@ -698,6 +760,10 @@ def main():
     upstream.add_argument("--max-depth")
     export = commands.add_parser("export")
     export.add_argument("--id", action="append", dest="ids")
+    export_csv_cmd = commands.add_parser(
+        "export-csv",
+        help="export selected datasets and their fields as a field-level CSV data dictionary")
+    export_csv_cmd.add_argument("--id", action="append", dest="ids")
     common_upstream = commands.add_parser(
         "common-upstream",
         help="find the common upstream datasets shared by repeated --id targets")
@@ -715,6 +781,9 @@ def main():
     args = parser.parse_args()
     try:
         catalog = DatasetCatalog(args.catalog)
+        if args.command == "export-csv":
+            sys.stdout.write(catalog.export_csv(None if args.ids is None else args.ids))
+            return 0
         if args.command == "register":
             result = catalog.register(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "import":

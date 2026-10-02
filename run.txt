@@ -30,6 +30,17 @@ the whole catalog is validated even outside the chain (key/id mismatch included)
 errors exit 2.
 python3 dataset_catalog.py export --id daily_totals
 Returns {"datasets":[orders record, daily_totals record]}, dependencies first.
+python3 dataset_catalog.py export-csv --id daily_totals
+Prints the field-level CSV data dictionary; fixed header
+dataset_id,description,owner,tags,depends_on,field_name,field_type, one row per field in registered
+field order with dataset metadata repeated on each row. It reuses export's --catalog, repeatable
+--id and selection semantics (None = all, [] = empty, duplicate ids merge, full upstream closure
+included, input order irrelevant); datasets stay dependencies first. Missing owner is an empty cell,
+missing tags is []; tags and depends_on are compact JSON arrays preserving Chinese (tags in stored
+order, dependencies sorted by id). Cells with commas, double quotes or newlines are double quoted
+with inner quotes doubled, and newlines in field names or descriptions pass through; every line ends
+with \n. An empty catalog or empty selection prints only the terminated header; read-only, errors
+print JSON containing only error and exit 2.
 python3 dataset_catalog.py search "daily amount"
 Returns only orders with matched_fields ["amount"]; search is read-only.
 python3 dataset_catalog.py search --field-type integer
