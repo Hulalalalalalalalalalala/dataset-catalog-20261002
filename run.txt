@@ -11,6 +11,11 @@ python3 dataset_catalog.py dependencies daily_totals
 Returns orders as the only direct dependency.
 python3 dataset_catalog.py impact orders
 Returns daily_totals at distance 1 with path ["orders","daily_totals"].
+python3 dataset_catalog.py upstream daily_totals
+Returns orders at distance 1 with path ["daily_totals","orders"]; upstream is the recursive
+reverse of dependencies, each upstream once sorted by distance then id, --max-depth N limits
+the shortest distances returned while still validating the full upstream closure; a leaf or an
+empty closure returns []; read-only, errors exit 2.
 python3 dataset_catalog.py export --id daily_totals
 Returns {"datasets":[orders record, daily_totals record]}, dependencies first.
 python3 dataset_catalog.py search "daily amount"

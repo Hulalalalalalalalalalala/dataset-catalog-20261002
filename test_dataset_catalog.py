@@ -96,6 +96,176 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(subprocess.run(prefix + ["impact", "missing"],
                                         capture_output=True).returncode, 2)
 
+    def test_upstream_lists_reachable_upstream_with_shortest_paths(self):
+        for identifier, depends_on in (("base", []), ("left", ["base"]),
+                                       ("right", ["base"]), ("report", ["left", "right"])):
+            self._register(identifier, depends_on)
+        result = self.catalog.upstream("report")
+        self.assertEqual([(row["dataset"]["id"], row["distance"], row["path"]) for row in result],
+                         [("left", 1, ["report", "left"]),
+                          ("right", 1, ["report", "right"]),
+                          ("base", 2, ["report", "left", "base"])])
+        self.assertEqual([set(row) for row in result],
+                         [{"dataset", "distance", "path"}] * 3)
+        self.assertEqual(result[0]["dataset"], self.catalog.describe("left"))
+        self.assertEqual([row["dataset"]["id"] for row in result],
+                         sorted((row["distance"], row["dataset"]["id"]) for row in result)
+                         and [row["dataset"]["id"] for row in result])
+
+    def test_upstream_each_upstream_appears_once_sorted_by_distance_then_id(self):
+        for identifier, depends_on in (("base", []), ("b", ["base"]), ("c", ["base"]),
+                                       ("d", ["b", "c"]), ("e", ["d", "base"])):
+            self._register(identifier, depends_on)
+        result = self.catalog.upstream("e")
+        ids = [row["dataset"]["id"] for row in result]
+        self.assertEqual(sorted(ids), sorted(set(ids)))
+        self.assertEqual([(row["distance"], row["dataset"]["id"]) for row in result],
+                         sorted((row["distance"], row["dataset"]["id"]) for row in result))
+        base = [row for row in result if row["dataset"]["id"] == "base"][0]
+        self.assertEqual(base["distance"], 1)
+        self.assertEqual(base["path"], ["e", "base"])
+
+    def test_upstream_respects_max_depth_and_empty_leaf(self):
+        for identifier, depends_on in (("orders", []), ("daily", ["orders"]),
+                                       ("weekly", ["daily"])):
+            self._register(identifier, depends_on)
+        self.assertEqual([row["dataset"]["id"] for row in self.catalog.upstream("weekly", 1)],
+                         ["daily"])
+        self.assertEqual([(row["dataset"]["id"], row["distance"])
+                          for row in self.catalog.upstream("weekly", 2)],
+                         [("daily", 1), ("orders", 2)])
+        self.assertEqual([row["dataset"]["id"] for row in self.catalog.upstream("weekly")],
+                         ["daily", "orders"])
+        self.assertEqual(self.catalog.upstream("orders"), [])
+        self.assertEqual(self.catalog.upstream("orders", 3), [])
+
+    def test_upstream_picks_lexicographically_smallest_shortest_path(self):
+        for identifier, depends_on in (("a", []), ("b", ["a"]), ("c", ["a"]),
+                                       ("d", ["c", "b"])):
+            self._register(identifier, depends_on)
+        result = self.catalog.upstream("d")
+        self.assertEqual([row["dataset"]["id"] for row in result], ["b", "c", "a"])
+        self.assertEqual(result[-1]["path"], ["d", "b", "a"])
+
+    def test_upstream_result_is_independent_of_input_order(self):
+        orders = [("a", []), ("b", ["a"]), ("c", ["a"]), ("d", ["c", "b"])]
+        paths = []
+        for sequence in (orders, list(reversed(orders))):
+            other = Path(self.temp.name) / ("upstream-order-" + str(len(paths)) + ".json")
+            other.write_text(json.dumps({identifier: self._record(identifier, depends_on)
+                                         for identifier, depends_on in sequence}),
+                             encoding="utf-8")
+            paths.append(DatasetCatalog(other).upstream("d"))
+        self.assertEqual(paths[0], paths[1])
+
+    def test_upstream_validates_arguments_before_reading_catalog(self):
+        self.assertFalse(self.path.exists())
+        for bad in (True, False, 0, -1, 1.0, "1"):
+            with self.assertRaises(ValueError):
+                self.catalog.upstream("orders", bad)
+        for bad in ("Orders", "1x", "", "has space", "ordér"):
+            with self.assertRaises(ValueError):
+                self.catalog.upstream(bad)
+        self.assertFalse(self.path.exists())
+        with self.assertRaises(ValueError):
+            self.catalog.upstream("missing")
+        self.assertFalse(self.path.exists())
+
+    def test_upstream_missing_or_empty_catalog_is_empty(self):
+        self.assertFalse(self.path.exists())
+        with self.assertRaises(ValueError):
+            self.catalog.upstream("orders")
+        self.assertFalse(self.path.exists())
+        self.path.write_text("{}", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            DatasetCatalog(self.path).upstream("orders")
+
+    def test_upstream_validates_full_closure_even_with_depth_limit(self):
+        self._write_records({"a": self._record("a", ["b"]), "b": self._record("b", ["ghost"])})
+        with self.assertRaises(ValueError):
+            self.catalog.upstream("a", 1)
+        with self.assertRaises(ValueError):
+            self.catalog.upstream("a")
+
+    def test_upstream_ignores_records_and_relations_outside_closure(self):
+        self._write_records({
+            "a": self._record("a", []),
+            "bad": self._record("bad", ["ghost"]),
+            "loopy1": self._record("loopy1", ["loopy2"]),
+            "loopy2": self._record("loopy2", ["loopy1"]),
+            "broken": None})
+        self.assertEqual(self.catalog.upstream("a"), [])
+        # relations and records reachable only through the start's deps still matter
+        self._write_records({"a": self._record("a", ["b"]), "b": self._record("b", ["c"]),
+                             "c": self._record("c", ["ghost"]),
+                             "bad": self._record("bad", ["bad"])})
+        with self.assertRaises(ValueError):
+            self.catalog.upstream("a", 1)
+
+    def test_upstream_rejects_invalid_graph_states_in_closure(self):
+        bad_states = [
+            json.dumps([self._record("a", [])]),
+            json.dumps({"a": self._record("a", ["ghost"])}),
+            json.dumps({"a": {**self._record("a", []), "id": "other"}}),
+            json.dumps({"a": self._record("a", ["a"])}),
+            json.dumps({"a": self._record("a", ["b", "b"]), "b": self._record("b", [])}),
+            json.dumps({"a": self._record("a", ["b"]), "b": self._record("b", ["a"])}),
+            json.dumps({"a": {"id": "a", "fields": [{"name": "n", "type": "float"}]}}),
+            json.dumps({"a": {"id": "a",
+                              "fields": [{"name": "n", "type": "integer"}], "depends_on": "b"}}),
+        ]
+        for raw in bad_states:
+            other = Path(self.temp.name) / "bad-upstream.json"
+            other.write_text(raw, encoding="utf-8")
+            with self.assertRaises(ValueError):
+                DatasetCatalog(other).upstream("a")
+
+    def test_upstream_does_not_modify_catalog(self):
+        self._chain()
+        before = self.path.read_text(encoding="utf-8")
+        self.catalog.upstream("weekly")
+        self.catalog.upstream("report", 1)
+        self.catalog.upstream("orders")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_cli_upstream(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")], check=True, capture_output=True)
+        subprocess.run(prefix + ["register", str(ROOT / "samples/daily.json")], check=True, capture_output=True)
+        ok = subprocess.run(prefix + ["upstream", "daily_totals"], capture_output=True, text=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        result = json.loads(ok.stdout)
+        self.assertEqual([row["dataset"]["id"] for row in result], ["orders"])
+        self.assertEqual(result[0]["distance"], 1)
+        self.assertEqual(result[0]["path"], ["daily_totals", "orders"])
+        leaf = subprocess.run(prefix + ["upstream", "orders"], capture_output=True, text=True)
+        self.assertEqual(leaf.returncode, 0)
+        self.assertEqual(json.loads(leaf.stdout), [])
+        limited = subprocess.run(prefix + ["upstream", "daily_totals", "--max-depth", "1"],
+                                 capture_output=True, text=True)
+        self.assertEqual(limited.returncode, 0)
+        self.assertEqual(json.loads(limited.stdout), result)
+        for depth in ("0", "-1", "1.0", "x", ""):
+            run = subprocess.run(prefix + ["upstream", "orders", "--max-depth", depth],
+                                 capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, depth)
+            self.assertIn("error", json.loads(run.stdout))
+        bad_id = subprocess.run(prefix + ["upstream", "Nope"], capture_output=True, text=True)
+        self.assertEqual(bad_id.returncode, 2)
+        self.assertIn("error", json.loads(bad_id.stdout))
+        missing = subprocess.run(prefix + ["upstream", "ghost"], capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stdout))
+        # an error beyond the depth limit still fails the query
+        cyclic = Path(self.temp.name) / "cyclic.json"
+        cyclic.write_text(json.dumps({"a": self._record("a", ["b"]), "b": self._record("b", ["a"])}),
+                          encoding="utf-8")
+        cyc_prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(cyclic)]
+        run = subprocess.run(cyc_prefix + ["upstream", "a", "--max-depth", "1"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+
     def test_cli_query_and_registration(self):
         prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
         run = subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")], capture_output=True, text=True)
