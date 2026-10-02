@@ -94,6 +94,38 @@ class DatasetCatalog:
         result.sort(key=lambda item: (item["distance"], item["dataset"]["id"]))
         return result
 
+    def search(self, query="", field_type=None):
+        if not isinstance(query, str):
+            raise ValueError("query must be a string")
+        if field_type is not None and field_type not in ("string", "integer", "number", "boolean"):
+            raise ValueError("unsupported field type")
+        words = set(query.casefold().split())
+        records = self.entries()
+        found = []
+        for identifier in sorted(records):
+            entry = records[identifier]
+            if field_type is not None and not any(field["type"] == field_type
+                                                  for field in entry["fields"]):
+                continue
+            matched_fields = []
+            if words:
+                identifier_text = entry["id"].casefold()
+                description_text = str(entry.get("description", "")).casefold()
+                field_names = [(field["name"], field["name"].casefold())
+                               for field in entry["fields"]]
+                matched_fields = [name for name, name_text in field_names
+                                  if any(word in name_text for word in words)]
+
+                def word_matches(word):
+                    if word in identifier_text or word in description_text:
+                        return True
+                    return any(word in name_text for _, name_text in field_names)
+
+                if not all(word_matches(word) for word in words):
+                    continue
+            found.append({"dataset": entry, "matched_fields": matched_fields})
+        return found
+
     def export(self, identifiers=None):
         if identifiers is not None and not isinstance(identifiers, list):
             raise ValueError("identifiers must be None or a list of dataset ids")
@@ -153,11 +185,16 @@ def main():
     impact.add_argument("--max-depth")
     export = commands.add_parser("export")
     export.add_argument("--id", action="append", dest="ids")
+    search = commands.add_parser("search")
+    search.add_argument("query", nargs="?", default="")
+    search.add_argument("--field-type", dest="field_type")
     args = parser.parse_args()
     try:
         catalog = DatasetCatalog(args.catalog)
         if args.command == "register":
             result = catalog.register(json.loads(Path(args.file).read_text(encoding="utf-8")))
+        elif args.command == "search":
+            result = catalog.search(args.query, field_type=args.field_type)
         elif args.command == "export":
             result = catalog.export(None if args.ids is None else args.ids)
         elif args.command == "impact":

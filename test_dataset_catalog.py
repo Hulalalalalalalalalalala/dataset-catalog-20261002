@@ -210,5 +210,138 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("error", json.loads(bad.stdout))
 
 
+class SearchTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "catalog.json"
+        self.catalog = DatasetCatalog(self.path)
+        self.samples = DatasetCatalog(ROOT / "samples" / "catalog.json")
+
+    def _copy_samples(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text((ROOT / "samples" / "catalog.json").read_text(encoding="utf-8"),
+                             encoding="utf-8")
+        return DatasetCatalog(self.path)
+
+    def test_sample_daily_amount_finds_only_orders_with_amount_field(self):
+        catalog = self._copy_samples()
+        result = catalog.search("daily amount")
+        self.assertEqual([row["dataset"]["id"] for row in result], ["orders"])
+        self.assertEqual(result[0]["matched_fields"], ["amount"])
+        self.assertEqual(result[0]["dataset"], catalog.describe("orders"))
+
+    def test_words_must_all_match_but_may_target_different_places(self):
+        catalog = self._copy_samples()
+        self.assertEqual([row["dataset"]["id"] for row in catalog.search("orders total")],
+                         ["daily_totals"])
+        self.assertEqual(catalog.search("amount total"), [])
+        result = catalog.search("order")
+        self.assertEqual([row["dataset"]["id"] for row in result], ["daily_totals", "orders"])
+        self.assertEqual(result[0]["matched_fields"], [])
+        self.assertEqual(result[1]["matched_fields"], ["order_id"])
+
+    def test_duplicate_and_whitespace_words_and_casefold(self):
+        catalog = self._copy_samples()
+        self.assertEqual([row["dataset"]["id"] for row in catalog.search("  ORDER   order ")],
+                         ["daily_totals", "orders"])
+        self.assertEqual(catalog.search(" \t\n ")[0]["matched_fields"], [])
+        self.assertEqual({row["dataset"]["id"] for row in catalog.search("AMOUNT")}, {"orders"})
+
+    def test_empty_query_matches_all_with_empty_matched_fields(self):
+        catalog = self._copy_samples()
+        for invocation in (catalog.search(""), catalog.search("   "),
+                           catalog.search("", field_type="number")):
+            self.assertEqual([row["dataset"]["id"] for row in invocation],
+                             ["daily_totals", "orders"])
+            self.assertTrue(all(row["matched_fields"] == [] for row in invocation))
+
+    def test_field_type_filter_and_combined_keywords(self):
+        catalog = self._copy_samples()
+        self.assertEqual({row["dataset"]["id"] for row in catalog.search(field_type="string")},
+                         {"daily_totals", "orders"})
+        result = catalog.search("day", field_type="integer")
+        self.assertEqual(result, [])
+        result = catalog.search("total", field_type="number")
+        self.assertEqual([row["dataset"]["id"] for row in result], ["daily_totals"])
+        self.assertEqual(result[0]["matched_fields"], ["total"])
+
+    def test_search_covers_id_description_and_field_names_but_not_dependencies(self):
+        catalog = self._copy_samples()
+        self.assertEqual({row["dataset"]["id"] for row in catalog.search("daily_totals")},
+                         {"daily_totals"})
+        self.assertEqual({row["dataset"]["id"] for row in catalog.search("amounts")},
+                         {"orders"})
+        self.assertEqual({row["dataset"]["id"] for row in catalog.search("number")}, set())
+
+    def test_missing_or_empty_catalog_returns_empty_list(self):
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.catalog.search("anything"), [])
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{}", encoding="utf-8")
+        self.assertEqual(DatasetCatalog(self.path).search("anything", field_type="string"), [])
+
+    def test_invalid_arguments_raise_even_on_empty_catalog(self):
+        self.assertFalse(self.path.exists())
+        for bad in (1, 1.0, True, None, ["x"], {"x"}):
+            with self.assertRaises(ValueError):
+                self.catalog.search(bad)
+        for bad in (1, True, "str", "STRING", "", "float"):
+            with self.assertRaises(ValueError):
+                self.catalog.search("", field_type=bad)
+
+    def test_search_does_not_create_or_modify_catalog(self):
+        self.assertFalse(self.path.exists())
+        self.samples.search("orders", field_type="string")
+        self.assertEqual([row["dataset"]["id"]
+                          for row in self.samples.search("daily amount")], ["orders"])
+        catalog = self._copy_samples()
+        before = self.path.read_text(encoding="utf-8")
+        catalog.search("", field_type="boolean")
+        catalog.search("orders")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_matched_fields_keep_order_without_duplicates(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps({
+            "d": {"id": "d", "description": "",
+                  "fields": [{"name": "alpha_id", "type": "string"},
+                             {"name": "beta", "type": "integer"},
+                             {"name": "alpha_two", "type": "string"}],
+                  "depends_on": []}}), encoding="utf-8")
+        result = DatasetCatalog(self.path).search("alpha id")
+        self.assertEqual(result[0]["matched_fields"], ["alpha_id", "alpha_two"])
+
+    def test_cli_search(self):
+        catalog_path = str(ROOT / "samples" / "catalog.json")
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", catalog_path]
+        ok = subprocess.run(prefix + ["search", "daily amount"], capture_output=True, text=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        result = json.loads(ok.stdout)
+        self.assertEqual([row["dataset"]["id"] for row in result], ["orders"])
+        self.assertEqual(result[0]["matched_fields"], ["amount"])
+        empty_query = subprocess.run(prefix + ["search"], capture_output=True, text=True)
+        self.assertEqual(empty_query.returncode, 0, empty_query.stderr)
+        self.assertEqual([row["dataset"]["id"] for row in json.loads(empty_query.stdout)],
+                         ["daily_totals", "orders"])
+        typed = subprocess.run(prefix + ["search", "total", "--field-type", "number"],
+                               capture_output=True, text=True)
+        self.assertEqual(typed.returncode, 0, typed.stderr)
+        self.assertEqual([row["dataset"]["id"] for row in json.loads(typed.stdout)],
+                         ["daily_totals"])
+        no_match = subprocess.run(prefix + ["search", "zzz"], capture_output=True, text=True)
+        self.assertEqual(json.loads(no_match.stdout), [])
+        missing_catalog = prefix[:3] + [str(Path(self.temp.name) / "nope" / "c.json")]
+        missing = subprocess.run(missing_catalog + ["search", "x"],
+                                 capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 0, missing.stderr)
+        self.assertEqual(json.loads(missing.stdout), [])
+        self.assertFalse(Path(self.temp.name, "nope").exists())
+        bad = subprocess.run(prefix + ["search", "x", "--field-type", "float"],
+                             capture_output=True, text=True)
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stdout))
+
+
 if __name__ == "__main__":
     unittest.main()
