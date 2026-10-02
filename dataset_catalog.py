@@ -3,7 +3,9 @@ import argparse
 import copy
 import heapq
 import json
+import os
 import re
+import tempfile
 from pathlib import Path
 
 
@@ -355,8 +357,7 @@ class DatasetCatalog:
                    for key, entry in records.items()}
         return self._diff_states(current, snapshot)
 
-    def preview_bundle(self, bundle):
-        snapshot = self._snapshot_state(bundle)
+    def _current_state(self):
         records = self.entries()
         if not isinstance(records, dict):
             raise ValueError("invalid catalog state")
@@ -370,6 +371,11 @@ class DatasetCatalog:
             current[key] = normalized
         if _toposort(current) is None:
             raise ValueError("dependency cycle detected")
+        return current
+
+    def preview_bundle(self, bundle):
+        snapshot = self._snapshot_state(bundle)
+        current = self._current_state()
 
         diff = self._diff_states(current, snapshot)
         sources = {row["id"] for row in diff["added"]}
@@ -401,6 +407,36 @@ class DatasetCatalog:
                 affected.append({"id": target, "causes": causes})
         return {"diff": diff, "affected": affected}
 
+    def apply_bundle(self, bundle):
+        snapshot = self._snapshot_state(bundle)
+        current = self._current_state()
+        diff = self._diff_states(current, snapshot)
+
+        if not diff["added"] and not diff["removed"] and not diff["changed"]:
+            return diff
+
+        payload = json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n"
+        directory = self.path.parent
+        existed = self.path.exists()
+        if not existed:
+            directory.mkdir(parents=True, exist_ok=True)
+        # Write via a sibling temp file and atomically replace, so a failed save
+        # never leaves a partial catalog (and a previously missing file stays missing).
+        descriptor = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                                 dir=directory, delete=False)
+        temporary = Path(descriptor.name)
+        try:
+            descriptor.write(payload)
+            descriptor.flush()
+            os.replace(temporary, self.path)
+        except OSError:
+            descriptor.close()
+            temporary.unlink(missing_ok=True)
+            raise
+        else:
+            descriptor.close()
+        return diff
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -412,6 +448,8 @@ def main():
     commands.add_parser("preview",
                         help="diff a snapshot bundle and preview the downstream impact of the change"
                         ).add_argument("file")
+    commands.add_parser("apply",
+                        help="replace the whole catalog state with a snapshot bundle").add_argument("file")
     commands.add_parser("describe").add_argument("id")
     commands.add_parser("dependencies").add_argument("id")
     impact = commands.add_parser("impact")
@@ -435,6 +473,8 @@ def main():
             result = catalog.diff_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "preview":
             result = catalog.preview_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
+        elif args.command == "apply":
+            result = catalog.apply_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "export":
             result = catalog.export(None if args.ids is None else args.ids)
         elif args.command == "impact":

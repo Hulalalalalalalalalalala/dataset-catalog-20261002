@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from dataset_catalog import DatasetCatalog
 
 ROOT = Path(__file__).resolve().parent
@@ -1070,6 +1071,245 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(run.returncode, 2)
         self.assertIn("error", json.loads(run.stdout))
         self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+
+
+    def test_apply_replaces_adds_removes_and_returns_pre_commit_diff(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("c", ["b"])]})
+        bundle = {"datasets": [
+            self._snapshot_record("a", description="updated"),
+            self._snapshot_record("b", ["a"]),
+            self._snapshot_record("d", ["a", "b"])]}
+        diff_before = self.catalog.diff_bundle(bundle)
+        result = self.catalog.apply_bundle(bundle)
+        self.assertEqual(result, diff_before)
+        self.assertEqual(set(result), {"added", "removed", "changed"})
+        self.assertEqual([row["id"] for row in result["added"]], ["d"])
+        self.assertEqual([row["id"] for row in result["removed"]], ["c"])
+        self.assertEqual([row["id"] for row in result["changed"]], ["a"])
+        self.assertEqual(result["changed"][0]["before"]["description"], "a desc")
+        self.assertEqual(result["changed"][0]["after"]["description"], "updated")
+
+        fresh = DatasetCatalog(self.path)
+        self.assertEqual(set(fresh.entries()), {"a", "b", "d"})
+        self.assertEqual(fresh.describe("a")["description"], "updated")
+        self.assertEqual(fresh.describe("d")["depends_on"], ["a", "b"])
+        with self.assertRaises(ValueError):
+            fresh.describe("c")
+        self.assertEqual([row["id"] for row in fresh.export()["datasets"]], ["a", "b", "d"])
+        self.assertEqual(fresh.diff_bundle(bundle),
+                         {"added": [], "removed": [], "changed": []})
+
+    def test_apply_partial_snapshot_is_full_state_and_empty_clears(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("orders"), self._snapshot_record("daily", ["orders"]),
+            self._snapshot_record("weekly", ["daily"])]})
+        partial = self.catalog.export(["daily"])
+        result = self.catalog.apply_bundle(partial)
+        self.assertEqual([row["id"] for row in result["removed"]], ["weekly"])
+        self.assertEqual(set(DatasetCatalog(self.path).entries()), {"orders", "daily"})
+
+        result = self.catalog.apply_bundle({"datasets": []})
+        self.assertEqual([row["id"] for row in result["removed"]], ["daily", "orders"])
+        self.assertEqual(DatasetCatalog(self.path).entries(), {})
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), {})
+
+    def test_apply_empty_diff_does_not_write_or_create_directories(self):
+        bundle = {"datasets": [self._snapshot_record("a"), self._snapshot_record("b", ["a"])]}
+        nested = Path(self.temp.name) / "state" / "nested" / "catalog.json"
+        catalog = DatasetCatalog(nested)
+        self.assertEqual(catalog.apply_bundle({"datasets": []}),
+                         {"added": [], "removed": [], "changed": []})
+        self.assertFalse(nested.exists())
+        self.assertFalse(nested.parent.exists())
+
+        self.catalog.import_bundle(bundle)
+        before = self.path.read_text(encoding="utf-8")
+        reordered = {"datasets": [self._snapshot_record("b", ["a"]),
+                                  self._snapshot_record("a")]}
+        self.assertEqual(self.catalog.apply_bundle(reordered),
+                         {"added": [], "removed": [], "changed": []})
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_apply_missing_catalog_treats_snapshot_as_all_added_and_creates_parents(self):
+        nested = Path(self.temp.name) / "state" / "nested" / "catalog.json"
+        catalog = DatasetCatalog(nested)
+        result = catalog.apply_bundle({"datasets": [
+            self._snapshot_record("c", ["a", "b"]), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("a")]})
+        self.assertEqual([row["id"] for row in result["added"]], ["a", "b", "c"])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["changed"], [])
+        self.assertTrue(nested.exists())
+        fresh = DatasetCatalog(nested)
+        self.assertEqual(set(fresh.entries()), {"a", "b", "c"})
+
+    def test_apply_empty_catalog_file_is_empty_state(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text("{}", encoding="utf-8")
+        result = self.catalog.apply_bundle({"datasets": []})
+        self.assertEqual(result, {"added": [], "removed": [], "changed": []})
+
+    def test_apply_normalizes_like_registration(self):
+        self.catalog.register(self._snapshot_record("old"))
+        result = self.catalog.apply_bundle({"datasets": [
+            {"id": "new", "description": 5,
+             "fields": [{"name": " V ", "type": "integer", "extra": "x"}],
+             "depends_on": ["old"], "tags": [" Finance ", "finance"], "ignored": 1},
+            {"id": "old", "fields": [{"name": "n", "type": "integer"}], "owner": "  Pat  "}]})
+        self.assertEqual([row["id"] for row in result["added"]], ["new"])
+        self.assertEqual([row["id"] for row in result["changed"]], ["old"])
+        new = DatasetCatalog(self.path).describe("new")
+        self.assertEqual(new, {"id": "new", "description": "5",
+                               "fields": [{"name": " V ", "type": "integer"}],
+                               "depends_on": ["old"], "tags": ["Finance"]})
+        self.assertEqual(DatasetCatalog(self.path).describe("old")["owner"], "Pat")
+
+    def test_apply_rejects_invalid_snapshot_without_writing(self):
+        self.catalog.register(self._snapshot_record("old"))
+        before = self.path.read_text(encoding="utf-8")
+        bad_bundles = [
+            [], None, "x", 1, True, {},
+            {"datasets": None}, {"datasets": {}}, {"datasets": "x"}, {"datasets": 1},
+            {"other": []},
+            {"datasets": [None]},
+            {"datasets": ["x"]},
+            {"datasets": [{"id": "bad id", "fields": [{"name": "n", "type": "integer"}]}]},
+            {"datasets": [{"id": "a"}]},
+            {"datasets": [{"id": "a", "fields": [{"name": "n", "type": "float"}]}]},
+            {"datasets": [self._snapshot_record("a"), self._snapshot_record("a")]},
+            {"datasets": [self._snapshot_record("a", ["a"])]},
+            {"datasets": [self._snapshot_record("a", ["b", "b"])]},
+            {"datasets": [self._snapshot_record("a", ["ghost"])]},
+            {"datasets": [self._snapshot_record("a", ["b"]), self._snapshot_record("b", ["a"])]},
+            {"datasets": [self._snapshot_record("a", tags=[""])]},
+        ]
+        for bundle in bad_bundles:
+            with self.assertRaises(ValueError):
+                self.catalog.apply_bundle(bundle)
+            self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+            self.assertEqual(set(DatasetCatalog(self.path).entries()), {"old"})
+
+    def test_apply_validates_current_catalog_without_writing(self):
+        good = {"datasets": [self._snapshot_record("a")]}
+        bad_state = json.dumps({"a": self._snapshot_record("a", ["ghost"])})
+        other = Path(self.temp.name) / "bad-catalog.json"
+        other.write_text(bad_state, encoding="utf-8")
+        before = other.read_text(encoding="utf-8")
+        with self.assertRaises(ValueError):
+            DatasetCatalog(other).apply_bundle(good)
+        self.assertEqual(other.read_text(encoding="utf-8"), before)
+
+    def test_apply_validation_failure_never_creates_missing_file(self):
+        nested = Path(self.temp.name) / "state" / "nested" / "catalog.json"
+        catalog = DatasetCatalog(nested)
+        with self.assertRaises(ValueError):
+            catalog.apply_bundle({"datasets": [self._snapshot_record("a", ["ghost"])]})
+        self.assertFalse(nested.exists())
+        self.assertFalse(nested.parent.exists())
+
+    def test_apply_does_not_mutate_input_or_returned_records(self):
+        self.catalog.import_bundle({"datasets": [self._snapshot_record("a")]})
+        bundle = {"datasets": [
+            self._snapshot_record("a", description="changed", tags=["x"]),
+            self._snapshot_record("b", ["a"])]}
+        snapshot = json.loads(json.dumps(bundle))
+        result = self.catalog.apply_bundle(bundle)
+        self.assertEqual(bundle, snapshot)
+        result["added"][0]["description"] = "tampered"
+        result["changed"][0]["after"]["description"] = "tampered"
+        fresh = DatasetCatalog(self.path)
+        self.assertEqual(fresh.describe("b")["description"], "b desc")
+        self.assertEqual(fresh.describe("a")["description"], "changed")
+        self.assertEqual(self.catalog.diff_bundle(bundle),
+                         {"added": [], "removed": [], "changed": []})
+
+    def test_apply_save_failure_leaves_original_contents(self):
+        self.catalog.register(self._snapshot_record("old"))
+        before = self.path.read_text(encoding="utf-8")
+
+        with mock.patch("dataset_catalog.os.replace", side_effect=OSError("simulated failure")):
+            with self.assertRaises(OSError):
+                self.catalog.apply_bundle({"datasets": [self._snapshot_record("new")]})
+
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+        self.assertEqual(set(DatasetCatalog(self.path).entries()), {"old"})
+        # no temp files left behind
+        self.assertEqual([p.name for p in self.path.parent.glob("tmp*")], [])
+
+    def test_cli_apply_success_and_errors(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")],
+                       check=True, capture_output=True)
+        subprocess.run(prefix + ["register", str(ROOT / "samples/daily.json")],
+                       check=True, capture_output=True)
+
+        snapshot_path = Path(self.temp.name) / "snapshot.json"
+        snapshot_path.write_text(json.dumps({"datasets": [
+            {"id": "orders", "description": "Order amounts from the daily export",
+             "fields": [{"name": "order_id", "type": "string"},
+                        {"name": "amount", "type": "number"}], "depends_on": []},
+            {"id": "daily_totals", "description": "updated description",
+             "fields": [{"name": "day", "type": "string"}, {"name": "total", "type": "number"}],
+             "depends_on": ["orders"]},
+            {"id": "report", "description": "new",
+             "fields": [{"name": "id", "type": "string"}], "depends_on": ["orders"]}]},
+            ensure_ascii=False), encoding="utf-8")
+        run = subprocess.run(prefix + ["apply", str(snapshot_path)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual(set(result), {"added", "removed", "changed"})
+        self.assertEqual([row["id"] for row in result["added"]], ["report"])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["changed"][0]["changed_keys"], ["description"])
+
+        query = subprocess.run(prefix + ["describe", "report"], capture_output=True, text=True)
+        self.assertEqual(query.returncode, 0)
+        with self.assertRaises(subprocess.CalledProcessError):
+            subprocess.run(prefix + ["describe", "other"], check=True, capture_output=True)
+        export = subprocess.run(prefix + ["export"], capture_output=True, text=True)
+        self.assertEqual({row["id"] for row in json.loads(export.stdout)["datasets"]},
+                         {"orders", "daily_totals", "report"})
+
+        # second apply of the same snapshot is a no-op diff, still exit 0
+        again = subprocess.run(prefix + ["apply", str(snapshot_path)],
+                               capture_output=True, text=True)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(json.loads(again.stdout),
+                         {"added": [], "removed": [], "changed": []})
+
+        missing = subprocess.run(prefix + ["apply", str(Path(self.temp.name) / "nope.json")],
+                                 capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stdout))
+        bad_json = Path(self.temp.name) / "bad.json"
+        bad_json.write_text("{not json", encoding="utf-8")
+        run = subprocess.run(prefix + ["apply", str(bad_json)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+        invalid = Path(self.temp.name) / "invalid.json"
+        invalid.write_text(json.dumps({"datasets": [
+            {"id": "a", "fields": [{"name": "n", "type": "integer"}], "depends_on": ["a"]}]}),
+            encoding="utf-8")
+        before = self.path.read_text(encoding="utf-8")
+        run = subprocess.run(prefix + ["apply", str(invalid)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_cli_apply_creates_missing_catalog(self):
+        nested = Path(self.temp.name) / "state" / "nested" / "catalog.json"
+        snapshot = Path(self.temp.name) / "snapshot.json"
+        snapshot.write_text(json.dumps({"datasets": [self._snapshot_record("a")]}),
+                            encoding="utf-8")
+        run = subprocess.run([sys.executable, str(ROOT / "dataset_catalog.py"),
+                              "--catalog", str(nested), "apply", str(snapshot)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue(nested.exists())
+        self.assertEqual(json.loads(nested.read_text(encoding="utf-8"))["a"]["id"], "a")
 
 
 if __name__ == "__main__":
