@@ -9,6 +9,24 @@ from pathlib import Path
 FIELD_TYPES = ("string", "integer", "number", "boolean")
 
 
+def normalize_tags(tags):
+    if not isinstance(tags, list):
+        raise ValueError("tags must be a list of strings")
+    normalized = []
+    seen = set()
+    for tag in tags:
+        if not isinstance(tag, str):
+            raise ValueError("tags must be a list of strings")
+        cleaned = tag.strip()
+        if not cleaned:
+            raise ValueError("tags must be nonempty strings")
+        key = cleaned.casefold()
+        if key not in seen:
+            seen.add(key)
+            normalized.append(cleaned)
+    return normalized
+
+
 class DatasetCatalog:
     def __init__(self, path):
         self.path = Path(path)
@@ -48,6 +66,8 @@ class DatasetCatalog:
         entry = {"id": identifier, "description": str(dataset.get("description", "")),
                  "fields": [{"name": field["name"], "type": field["type"]} for field in fields],
                  "depends_on": sorted(dependencies)}
+        if "tags" in dataset:
+            entry["tags"] = normalize_tags(dataset["tags"])
         records[identifier] = entry
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -59,11 +79,12 @@ class DatasetCatalog:
             raise ValueError("unknown dataset")
         return records[identifier]
 
-    def search(self, query="", field_type=None):
+    def search(self, query="", field_type=None, tags=None):
         if not isinstance(query, str):
             raise ValueError("query must be a string")
         if field_type is not None and field_type not in FIELD_TYPES:
             raise ValueError("field_type must be None or one of string, integer, number, boolean")
+        required = {tag.casefold() for tag in normalize_tags(tags)} if tags is not None else set()
         words = {word.casefold() for word in query.split()}
         records = self.entries()
         results = []
@@ -71,6 +92,10 @@ class DatasetCatalog:
             entry = records[identifier]
             if field_type is not None and not any(field["type"] == field_type for field in entry["fields"]):
                 continue
+            if required:
+                owned = {tag.casefold() for tag in entry.get("tags", []) if isinstance(tag, str)}
+                if not required <= owned:
+                    continue
             matched_indices = set()
             matched = True
             dataset_haystack = (entry["id"] + "\n" + entry.get("description", "")).casefold()
@@ -187,6 +212,7 @@ def main():
     search = commands.add_parser("search")
     search.add_argument("query", nargs="?", default="")
     search.add_argument("--field-type", dest="field_type")
+    search.add_argument("--tag", action="append", dest="tags")
     args = parser.parse_args()
     try:
         catalog = DatasetCatalog(args.catalog)
@@ -204,7 +230,7 @@ def main():
                 max_depth = None
             result = catalog.impact(args.id, max_depth=max_depth)
         elif args.command == "search":
-            result = catalog.search(args.query, args.field_type)
+            result = catalog.search(args.query, args.field_type, args.tags)
         else:
             result = getattr(catalog, args.command)(args.id)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))

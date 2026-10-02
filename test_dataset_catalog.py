@@ -25,6 +25,103 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in fresh.dependencies("weekly")], ["daily"])
         self.assertEqual(fresh.describe("orders")["fields"], self.raw["fields"])
 
+    def test_register_normalizes_and_persists_tags(self):
+        entry = self.catalog.register({**self.raw, "tags": [" Finance ", "日汇总", "finance", "FINANCE"]})
+        self.assertEqual(entry["tags"], ["Finance", "日汇总"])
+        self.assertEqual(DatasetCatalog(self.path).describe("orders")["tags"], ["Finance", "日汇总"])
+        entry = self.catalog.register({"id": "daily", "fields": [{"name": "t", "type": "number"}], "tags": []})
+        self.assertEqual(entry["tags"], [])
+        self.assertEqual(DatasetCatalog(self.path).describe("daily")["tags"], [])
+        entry = self.catalog.register({"id": "weekly", "fields": [{"name": "t", "type": "number"}]})
+        self.assertNotIn("tags", entry)
+        self.assertNotIn("tags", DatasetCatalog(self.path).describe("weekly"))
+
+    def test_register_rejects_invalid_tags_without_writing(self):
+        for bad in ("Finance", 1, True, {"a": 1}, ["ok", 1], [None], [""], ["  "], ["ok", "\t\n"]):
+            with self.assertRaises(ValueError):
+                self.catalog.register({**self.raw, "tags": bad})
+        self.assertFalse(self.path.exists())
+        self.catalog.register(self.raw)
+        before = self.path.read_text(encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.catalog.register({"id": "daily", "fields": [{"name": "t", "type": "number"}], "tags": [""]})
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def _tagged_records(self):
+        return {
+            "orders": {"id": "orders", "description": "Order amounts",
+                       "fields": [{"name": "amount", "type": "number"}], "depends_on": [],
+                       "tags": ["Finance", "日汇总"]},
+            "daily_totals": {"id": "daily_totals", "description": "Daily totals",
+                             "fields": [{"name": "total", "type": "number"}],
+                             "depends_on": ["orders"], "tags": ["Finance"]},
+            "legacy": {"id": "legacy", "description": "no tags here",
+                       "fields": [{"name": "n", "type": "integer"}], "depends_on": []}}
+
+    def test_search_filters_by_all_tags_with_casefold(self):
+        self._write_records(self._tagged_records())
+        result = self.catalog.search(tags=["finance", "日汇总"])
+        self.assertEqual([row["dataset"]["id"] for row in result], ["orders"])
+        result = self.catalog.search(tags=["FINANCE"])
+        self.assertEqual([row["dataset"]["id"] for row in result], ["daily_totals", "orders"])
+        self.assertEqual([row["dataset"]["id"] for row in self.catalog.search()],
+                         ["daily_totals", "legacy", "orders"])
+        self.assertEqual([row["dataset"]["id"] for row in self.catalog.search(tags=[])],
+                         ["daily_totals", "legacy", "orders"])
+        self.assertEqual([row["dataset"]["id"] for row in self.catalog.search(tags=None)],
+                         ["daily_totals", "legacy", "orders"])
+        self.assertEqual(self.catalog.search(tags=["finance", "missing"]), [])
+        self.assertEqual(self.catalog.search(tags=["fin"]), [])
+        result = self.catalog.search("daily", tags=["finance"])
+        self.assertEqual([row["dataset"]["id"] for row in result], ["daily_totals"])
+        result = self.catalog.search(field_type="integer", tags=["finance"])
+        self.assertEqual(result, [])
+
+    def test_search_tags_validated_before_reading_catalog(self):
+        self.assertFalse(self.path.exists())
+        for bad in ("finance", 1, True, {"a": 1}, ["ok", 2], [None], [""], ["  "]):
+            with self.assertRaises(ValueError):
+                self.catalog.search(tags=bad)
+        self.assertEqual(self.catalog.search(tags=["finance"]), [])
+        self.assertFalse(self.path.exists())
+
+    def test_search_tags_does_not_modify_catalog(self):
+        self._write_records(self._tagged_records())
+        before = self.path.read_text(encoding="utf-8")
+        self.catalog.search(tags=["finance"])
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+        self.assertNotIn("tags", self.catalog.describe("legacy"))
+
+    def test_cli_search_with_tags(self):
+        self._write_records(self._tagged_records())
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        run = subprocess.run(prefix + ["search", "--tag", "finance", "--tag", "日汇总"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual([row["dataset"]["id"] for row in json.loads(run.stdout)], ["orders"])
+        run = subprocess.run(prefix + ["search", "--tag", "FINANCE"], capture_output=True, text=True)
+        self.assertEqual([row["dataset"]["id"] for row in json.loads(run.stdout)],
+                         ["daily_totals", "orders"])
+        run = subprocess.run(prefix + ["search", "daily", "--tag", "finance", "--field-type", "number"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual([row["dataset"]["id"] for row in json.loads(run.stdout)], ["daily_totals"])
+        bad = subprocess.run(prefix + ["search", "--tag", "  "], capture_output=True, text=True)
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stdout))
+
+    def test_export_roundtrip_preserves_tags(self):
+        self.catalog.register({**self.raw, "tags": ["Finance", "日汇总"]})
+        self.catalog.register({"id": "daily", "fields": [{"name": "t", "type": "number"}],
+                               "depends_on": ["orders"], "tags": []})
+        bundle = self.catalog.export()
+        other = DatasetCatalog(Path(self.temp.name) / "other.json")
+        for row in bundle["datasets"]:
+            other.register(row)
+        self.assertEqual(other.describe("orders")["tags"], ["Finance", "日汇总"])
+        self.assertEqual(other.describe("daily")["tags"], [])
+        self.assertEqual(other.export(), bundle)
+
     def test_bad_dependencies_and_duplicate_fields_do_not_write(self):
         for item in ({**self.raw, "depends_on": ["unknown"]}, {**self.raw, "fields": self.raw["fields"] * 2}):
             with self.assertRaises(ValueError):
