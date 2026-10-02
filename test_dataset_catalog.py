@@ -103,6 +103,112 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(json.loads(query.stdout)["id"], "orders")
         self.assertEqual(subprocess.run(prefix + ["describe", "missing"], capture_output=True).returncode, 2)
 
+    def _chain(self):
+        for identifier, depends_on in (("orders", []), ("daily_totals", ["orders"]),
+                                       ("weekly", ["daily_totals"]), ("report", ["orders"])):
+            self._register(identifier, depends_on)
+
+    def test_export_all_orders_dependencies_before_dependents(self):
+        self._chain()
+        result = self.catalog.export()
+        self.assertEqual(set(result), {"datasets"})
+        ids = [row["id"] for row in result["datasets"]]
+        self.assertEqual(ids.index("orders"), 0)
+        self.assertLess(ids.index("daily_totals"), ids.index("weekly"))
+        self.assertEqual([row["id"] for row in self.catalog.export([])["datasets"]], [])
+
+    def test_export_selected_includes_only_upstream_closure(self):
+        self._chain()
+        ids = [row["id"] for row in self.catalog.export(["daily_totals"])["datasets"]]
+        self.assertEqual(ids, ["orders", "daily_totals"])
+        self.assertEqual([row["id"] for row in self.catalog.export(["orders"])["datasets"]], ["orders"])
+        ids = [row["id"] for row in self.catalog.export(["report", "weekly", "weekly"])["datasets"]]
+        self.assertEqual(ids, ["orders", "daily_totals", "report", "weekly"])
+        ids = [row["id"] for row in self.catalog.export(["weekly", "report"])["datasets"]]
+        self.assertEqual(ids, ["orders", "daily_totals", "report", "weekly"])
+        daily = self.catalog.describe("daily_totals")
+        self.assertEqual(self.catalog.export(["daily_totals"])["datasets"][1], daily)
+        self.assertEqual(list(self.catalog.export(["daily_totals"])["datasets"][1]),
+                         ["id", "description", "fields", "depends_on"])
+
+    def test_export_rejects_bad_arguments_and_unknown_ids(self):
+        self._register("orders")
+        for bad in ("orders", ("orders",), {1}, True, 1):
+            with self.assertRaises(ValueError):
+                self.catalog.export(bad)
+        for bad in ([""], ["Orders"], ["ord ers"], [1], [None], ["orders", ""]):
+            with self.assertRaises(ValueError):
+                self.catalog.export(bad)
+        with self.assertRaises(ValueError):
+            self.catalog.export(["missing"])
+
+    def _write_records(self, records):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(records), encoding="utf-8")
+
+    def _record(self, identifier, depends_on):
+        return {"id": identifier, "description": "",
+                "fields": [{"name": "n", "type": "integer"}], "depends_on": depends_on}
+
+    def test_export_fails_on_missing_dependency_or_cycle_within_selection(self):
+        self._write_records({"a": self._record("a", ["ghost"]), "b": self._record("b", [])})
+        with self.assertRaises(ValueError):
+            self.catalog.export(["a"])
+        self.assertEqual([row["id"] for row in self.catalog.export(["b"])["datasets"]], ["b"])
+        self._write_records({"a": self._record("a", ["b"]), "b": self._record("b", ["a"]),
+                             "c": self._record("c", [])})
+        with self.assertRaises(ValueError):
+            self.catalog.export(["a"])
+        self.assertEqual([row["id"] for row in self.catalog.export(["c"])["datasets"]], ["c"])
+
+    def test_export_missing_or_empty_catalog_file(self):
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.catalog.export(), {"datasets": []})
+        self.path.write_text("{}", encoding="utf-8")
+        self.assertEqual(DatasetCatalog(self.path).export(), {"datasets": []})
+        with self.assertRaises(ValueError):
+            self.catalog.export(["orders"])
+
+    def test_export_roundtrips_into_empty_catalog(self):
+        sample = DatasetCatalog(ROOT / "samples" / "catalog.json")
+        bundle = sample.export(["daily_totals"])
+        for row in bundle["datasets"]:
+            self.catalog.register(row)
+        rebuilt = DatasetCatalog(self.path)
+        original = DatasetCatalog(ROOT / "samples" / "catalog.json")
+        for identifier in ("orders", "daily_totals"):
+            self.assertEqual(rebuilt.describe(identifier), original.describe(identifier))
+        self.assertEqual([row["id"] for row in rebuilt.dependencies("daily_totals")], ["orders"])
+        self.assertEqual(rebuilt.dependencies("orders"), [])
+
+    def test_export_does_not_modify_catalog_file(self):
+        self._chain()
+        before = self.path.read_text(encoding="utf-8")
+        self.catalog.export(["weekly"])
+        self.catalog.export()
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_cli_export(self):
+        base = [sys.executable, str(ROOT / "dataset_catalog.py")]
+        ok = subprocess.run(base + ["export", "--id", "daily_totals"], capture_output=True, text=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        result = json.loads(ok.stdout)
+        self.assertEqual([row["id"] for row in result["datasets"]], ["orders", "daily_totals"])
+        full = subprocess.run(base + ["export"], capture_output=True, text=True)
+        self.assertEqual(full.returncode, 0, full.stderr)
+        self.assertEqual({row["id"] for row in json.loads(full.stdout)["datasets"]},
+                         {"orders", "daily_totals"})
+        custom = base + ["--catalog", str(self.path)]
+        missing = subprocess.run(custom + ["export", "--id", "nope"],
+                                 capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stdout))
+        empty = subprocess.run(custom + ["export"], capture_output=True, text=True)
+        self.assertEqual(json.loads(empty.stdout), {"datasets": []})
+        bad = subprocess.run(base + ["export", "--id", ""], capture_output=True, text=True)
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stdout))
+
 
 if __name__ == "__main__":
     unittest.main()
