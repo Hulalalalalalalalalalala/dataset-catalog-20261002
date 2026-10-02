@@ -3,7 +3,9 @@ import argparse
 import copy
 import heapq
 import json
+import os
 import re
+import tempfile
 from pathlib import Path
 
 
@@ -355,8 +357,7 @@ class DatasetCatalog:
                    for key, entry in records.items()}
         return self._diff_states(current, snapshot)
 
-    def preview_bundle(self, bundle):
-        snapshot = self._snapshot_state(bundle)
+    def _current_state(self):
         records = self.entries()
         if not isinstance(records, dict):
             raise ValueError("invalid catalog state")
@@ -370,6 +371,11 @@ class DatasetCatalog:
             current[key] = normalized
         if _toposort(current) is None:
             raise ValueError("dependency cycle detected")
+        return current
+
+    def preview_bundle(self, bundle):
+        snapshot = self._snapshot_state(bundle)
+        current = self._current_state()
 
         diff = self._diff_states(current, snapshot)
         sources = {row["id"] for row in diff["added"]}
@@ -401,6 +407,31 @@ class DatasetCatalog:
                 affected.append({"id": target, "causes": causes})
         return {"diff": diff, "affected": affected}
 
+    def _save_records(self, records):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        data = json.dumps(records, ensure_ascii=False, indent=2) + "\n"
+        fd, temp_name = tempfile.mkstemp(dir=str(self.path.parent),
+                                         prefix=self.path.name + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(data)
+            os.replace(temp_name, self.path)
+        except BaseException:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+            raise
+
+    def apply_bundle(self, bundle):
+        snapshot = self._snapshot_state(bundle)
+        current = self._current_state()
+        diff = self._diff_states(current, snapshot)
+        if diff["added"] or diff["removed"] or diff["changed"]:
+            ordered = _toposort(snapshot)
+            self._save_records({key: snapshot[key] for key in ordered})
+        return diff
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -411,6 +442,9 @@ def main():
     commands.add_parser("diff", help="compare the catalog with a read-only snapshot bundle").add_argument("file")
     commands.add_parser("preview",
                         help="diff a snapshot bundle and preview the downstream impact of the change"
+                        ).add_argument("file")
+    commands.add_parser("apply",
+                        help="apply a snapshot bundle as the complete catalog state"
                         ).add_argument("file")
     commands.add_parser("describe").add_argument("id")
     commands.add_parser("dependencies").add_argument("id")
@@ -435,6 +469,8 @@ def main():
             result = catalog.diff_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "preview":
             result = catalog.preview_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
+        elif args.command == "apply":
+            result = catalog.apply_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "export":
             result = catalog.export(None if args.ids is None else args.ids)
         elif args.command == "impact":

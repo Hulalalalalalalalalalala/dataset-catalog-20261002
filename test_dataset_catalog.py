@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from dataset_catalog import DatasetCatalog
 
 ROOT = Path(__file__).resolve().parent
@@ -1070,6 +1071,217 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(run.returncode, 2)
         self.assertIn("error", json.loads(run.stdout))
         self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+
+    def test_apply_commits_snapshot_and_returns_pre_commit_diff(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b"),
+            self._snapshot_record("c", ["b"])]})
+        bundle = {"datasets": [
+            self._snapshot_record("c", ["b"], description="updated"),
+            self._snapshot_record("b"),
+            self._snapshot_record("d", ["b"])]}
+        expected = self.catalog.diff_bundle(bundle)
+        result = self.catalog.apply_bundle(bundle)
+        self.assertEqual(result, expected)
+        self.assertEqual([row["id"] for row in result["added"]], ["d"])
+        self.assertEqual([row["id"] for row in result["removed"]], ["a"])
+        self.assertEqual([row["id"] for row in result["changed"]], ["c"])
+        self.assertEqual(result["changed"][0]["changed_keys"], ["description"])
+        fresh = DatasetCatalog(self.path)
+        self.assertEqual([row["id"] for row in fresh.export()["datasets"]], ["b", "c", "d"])
+        self.assertEqual(fresh.describe("c")["description"], "updated")
+        self.assertEqual(self.catalog.describe("c")["description"], "updated")
+        with self.assertRaises(ValueError):
+            fresh.describe("a")
+        self.assertEqual(self.catalog.diff_bundle(bundle),
+                         {"added": [], "removed": [], "changed": []})
+
+    def test_apply_normalizes_and_allows_forward_references(self):
+        result = self.catalog.apply_bundle({"datasets": [
+            {"id": "c", "description": 7, "extra": True,
+             "fields": [{"name": "n", "type": "integer", "ignored": 1}],
+             "depends_on": ["b", "a"], "tags": [" X ", "x"], "owner": "  Team A "},
+            {"id": "b", "fields": [{"name": "n", "type": "integer"}], "depends_on": ["a"]},
+            {"id": "a", "fields": [{"name": "n", "type": "integer"}]}],
+            "ignored": 1})
+        self.assertEqual([row["id"] for row in result["added"]], ["a", "b", "c"])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["changed"], [])
+        fresh = DatasetCatalog(self.path)
+        self.assertEqual(fresh.describe("c"),
+                         {"id": "c", "description": "7",
+                          "fields": [{"name": "n", "type": "integer"}],
+                          "depends_on": ["a", "b"], "tags": ["X"], "owner": "Team A"})
+        self.assertEqual([row["id"] for row in fresh.export()["datasets"]], ["a", "b", "c"])
+        saved = self.path.read_text(encoding="utf-8")
+        self.assertTrue(saved.endswith("\n"))
+        self.assertEqual(set(json.loads(saved)), {"a", "b", "c"})
+
+    def test_apply_empty_snapshot_clears_catalog(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"])]})
+        result = self.catalog.apply_bundle({"datasets": []})
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual([row["id"] for row in result["removed"]], ["a", "b"])
+        self.assertEqual(self.catalog.export(), {"datasets": []})
+        self.assertEqual(self.catalog.search(), [])
+
+    def test_apply_without_differences_never_writes_or_creates_dirs(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"])]})
+        before = self.path.read_text(encoding="utf-8")
+        result = self.catalog.apply_bundle({"datasets": [
+            self._snapshot_record("b", ["a"]), self._snapshot_record("a")]})
+        self.assertEqual(result, {"added": [], "removed": [], "changed": []})
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+        nested = Path(self.temp.name) / "state" / "nested" / "catalog.json"
+        catalog = DatasetCatalog(nested)
+        self.assertEqual(catalog.apply_bundle({"datasets": []}),
+                         {"added": [], "removed": [], "changed": []})
+        self.assertFalse(nested.exists())
+        self.assertFalse(nested.parent.exists())
+
+    def test_apply_rejects_invalid_snapshot_without_writing(self):
+        nested = Path(self.temp.name) / "state" / "nested" / "catalog.json"
+        empty_catalog = DatasetCatalog(nested)
+        bad_bundles = [
+            [], None, "x", 1, True, {},
+            {"datasets": None}, {"datasets": {}}, {"datasets": "x"}, {"datasets": 1},
+            {"other": []},
+            {"datasets": [None]},
+            {"datasets": ["x"]},
+            {"datasets": [{"id": "bad id", "fields": [{"name": "n", "type": "integer"}]}]},
+            {"datasets": [{"id": "a"}]},
+            {"datasets": [{"id": "a", "fields": [{"name": "n", "type": "float"}]}]},
+            {"datasets": [self._snapshot_record("a"), self._snapshot_record("a")]},
+            {"datasets": [self._snapshot_record("a", ["a"])]},
+            {"datasets": [self._snapshot_record("a", ["b", "b"])]},
+            {"datasets": [self._snapshot_record("a", ["ghost"])]},
+            {"datasets": [self._snapshot_record("a", ["b"]),
+                          self._snapshot_record("b", ["a"])]},
+            {"datasets": [self._snapshot_record("a", tags=[""])]},
+        ]
+        for bundle in bad_bundles:
+            with self.assertRaises(ValueError):
+                empty_catalog.apply_bundle(bundle)
+        self.assertFalse(nested.exists())
+        self.assertFalse(nested.parent.exists())
+
+        self.catalog.register(self._snapshot_record("old"))
+        before = self.path.read_text(encoding="utf-8")
+        for bundle in bad_bundles:
+            with self.assertRaises(ValueError):
+                self.catalog.apply_bundle(bundle)
+            self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_apply_validates_current_catalog_like_preview(self):
+        good = {"datasets": [self._snapshot_record("a")]}
+        bad_states = [
+            json.dumps([self._snapshot_record("a")]),
+            json.dumps({"a": "x"}),
+            json.dumps({"a": self._snapshot_record("a", ["ghost"])}),
+            json.dumps({"a": self._snapshot_record("a", ["a"])}),
+            json.dumps({"a": self._snapshot_record("a", ["b", "b"]),
+                        "b": self._snapshot_record("b")}),
+            json.dumps({"a": {**self._snapshot_record("a"), "id": "other"}}),
+            json.dumps({"a": self._snapshot_record("a", ["b"]),
+                        "b": self._snapshot_record("b", ["a"])}),
+        ]
+        for index, raw in enumerate(bad_states):
+            other = Path(self.temp.name) / ("bad-apply-" + str(index) + ".json")
+            other.write_text(raw, encoding="utf-8")
+            with self.assertRaises(ValueError):
+                DatasetCatalog(other).apply_bundle(good)
+            self.assertEqual(other.read_text(encoding="utf-8"), raw)
+
+    def test_apply_does_not_mutate_input_and_result_is_detached(self):
+        self.catalog.import_bundle({"datasets": [self._snapshot_record("a")]})
+        bundle = {"datasets": [
+            self._snapshot_record("a", description="changed"),
+            self._snapshot_record("b", ["a"], tags=[" Finance ", "finance"])]}
+        snapshot = json.loads(json.dumps(bundle))
+        result = self.catalog.apply_bundle(bundle)
+        self.assertEqual(bundle, snapshot)
+        result["added"][0]["tags"].append("tampered")
+        result["changed"][0]["after"]["description"] = "tampered"
+        fresh = DatasetCatalog(self.path)
+        self.assertEqual(fresh.describe("b")["tags"], ["Finance"])
+        self.assertEqual(fresh.describe("a")["description"], "changed")
+        again = self.catalog.diff_bundle(bundle)
+        self.assertEqual(again, {"added": [], "removed": [], "changed": []})
+
+    def test_apply_save_failure_raises_oserror_and_preserves_state(self):
+        self.catalog.register(self._snapshot_record("old"))
+        before = self.path.read_text(encoding="utf-8")
+        bundle = {"datasets": [self._snapshot_record("new")]}
+        with mock.patch("dataset_catalog.os.replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                self.catalog.apply_bundle(bundle)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+        self.assertEqual([row["id"] for row in self.catalog.export()["datasets"]], ["old"])
+        leftovers = [item for item in self.path.parent.iterdir() if item != self.path]
+        self.assertEqual(leftovers, [])
+
+        nested = Path(self.temp.name) / "empty" / "catalog.json"
+        nested.parent.mkdir(parents=True)
+        missing = DatasetCatalog(nested)
+        with mock.patch("dataset_catalog.os.replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                missing.apply_bundle(bundle)
+        self.assertFalse(nested.exists())
+        self.assertEqual(list(nested.parent.iterdir()), [])
+
+    def test_cli_apply(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")],
+                       check=True, capture_output=True)
+        subprocess.run(prefix + ["register", str(ROOT / "samples/daily.json")],
+                       check=True, capture_output=True)
+
+        snapshot_path = Path(self.temp.name) / "snapshot.json"
+        snapshot_path.write_text(json.dumps({"datasets": [
+            {"id": "orders", "description": "Order amounts from the daily export",
+             "fields": [{"name": "order_id", "type": "string"},
+                        {"name": "amount", "type": "number"}], "depends_on": []},
+            {"id": "report", "description": "new",
+             "fields": [{"name": "id", "type": "string"}], "depends_on": ["orders"]}]},
+            ensure_ascii=False), encoding="utf-8")
+        run = subprocess.run(prefix + ["apply", str(snapshot_path)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual(set(result), {"added", "removed", "changed"})
+        self.assertEqual([row["id"] for row in result["added"]], ["report"])
+        self.assertEqual([row["id"] for row in result["removed"]], ["daily_totals"])
+        self.assertEqual(result["changed"], [])
+        exported = subprocess.run(prefix + ["export"], capture_output=True, text=True)
+        self.assertEqual([row["id"] for row in json.loads(exported.stdout)["datasets"]],
+                         ["orders", "report"])
+
+        rerun = subprocess.run(prefix + ["apply", str(snapshot_path)],
+                               capture_output=True, text=True)
+        self.assertEqual(rerun.returncode, 0)
+        self.assertEqual(json.loads(rerun.stdout), {"added": [], "removed": [], "changed": []})
+
+        before = self.path.read_text(encoding="utf-8")
+        missing = subprocess.run(prefix + ["apply", str(Path(self.temp.name) / "nope.json")],
+                                 capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stdout))
+        bad_json = Path(self.temp.name) / "bad.json"
+        bad_json.write_text("{not json", encoding="utf-8")
+        run = subprocess.run(prefix + ["apply", str(bad_json)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+        invalid = Path(self.temp.name) / "invalid.json"
+        invalid.write_text(json.dumps({"datasets": [
+            {"id": "a", "fields": [{"name": "n", "type": "integer"}], "depends_on": ["ghost"]}]}),
+            encoding="utf-8")
+        run = subprocess.run(prefix + ["apply", str(invalid)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
 
 
 if __name__ == "__main__":
