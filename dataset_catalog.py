@@ -423,9 +423,12 @@ class DatasetCatalog:
                 pass
             raise
 
-    def apply_bundle(self, bundle):
+    def apply_bundle(self, bundle, expected_bundle=None):
         snapshot = self._snapshot_state(bundle)
+        expected = self._snapshot_state(expected_bundle) if expected_bundle is not None else None
         current = self._current_state()
+        if expected is not None and current != expected:
+            raise ValueError("catalog does not match expected snapshot")
         diff = self._diff_states(current, snapshot)
         if diff["added"] or diff["removed"] or diff["changed"]:
             ordered = _toposort(snapshot)
@@ -443,9 +446,11 @@ def main():
     commands.add_parser("preview",
                         help="diff a snapshot bundle and preview the downstream impact of the change"
                         ).add_argument("file")
-    commands.add_parser("apply",
-                        help="apply a snapshot bundle as the complete catalog state"
-                        ).add_argument("file")
+    apply = commands.add_parser("apply",
+                                help="apply a snapshot bundle as the complete catalog state")
+    apply.add_argument("file")
+    apply.add_argument("--expected",
+                        help="snapshot the current catalog must match before the apply is committed")
     commands.add_parser("describe").add_argument("id")
     commands.add_parser("dependencies").add_argument("id")
     impact = commands.add_parser("impact")
@@ -470,7 +475,14 @@ def main():
         elif args.command == "preview":
             result = catalog.preview_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "apply":
-            result = catalog.apply_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
+            target = json.loads(Path(args.file).read_text(encoding="utf-8"))
+            if args.expected is not None:
+                expected = json.loads(Path(args.expected).read_text(encoding="utf-8"))
+                if expected is None:
+                    raise ValueError("expected snapshot must be an object")
+                result = catalog.apply_bundle(target, expected_bundle=expected)
+            else:
+                result = catalog.apply_bundle(target)
         elif args.command == "export":
             result = catalog.export(None if args.ids is None else args.ids)
         elif args.command == "impact":

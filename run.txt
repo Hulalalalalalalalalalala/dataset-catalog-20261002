@@ -24,8 +24,10 @@ python3 dataset_catalog.py preview FILE
 Prints {"diff":{...},"affected":[...]}: the diff result plus every downstream dataset reached from
 an added, removed or changed source, with lexicographically-smallest shortest before/after paths;
 read-only, errors exit 2.
-python3 dataset_catalog.py apply FILE
+python3 dataset_catalog.py apply FILE [--expected FILE]
 Commits a {"datasets":[...]} snapshot file as the complete catalog state (same-id records replaced,
 new ids added, absent records removed) and prints the pre-commit
 {"added":[...],"removed":[...],"changed":[...]} diff; all-or-nothing, errors exit 2.
+With --expected FILE the commit proceeds only when the current catalog matches that snapshot
+(normalized, by dataset id); a mismatch prints JSON with error and exits 2 without writing.
 python3 -B -m unittest -v
