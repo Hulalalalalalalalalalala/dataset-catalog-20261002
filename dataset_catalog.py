@@ -34,15 +34,12 @@ class DatasetCatalog:
     def entries(self):
         return json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
 
-    def register(self, dataset):
-        records = self.entries()
+    def _normalize_entry(self, dataset, known_ids):
         if not isinstance(dataset, dict):
             raise ValueError("invalid dataset descriptor")
         identifier = dataset.get("id")
         if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
             raise ValueError("invalid dataset id")
-        if identifier in records:
-            raise ValueError("dataset already registered")
         fields = dataset.get("fields")
         if not isinstance(fields, list) or not fields:
             raise ValueError("at least one field is required")
@@ -61,13 +58,25 @@ class DatasetCatalog:
         dependencies = dataset.get("depends_on", [])
         if not isinstance(dependencies, list) or any(not isinstance(item, str) for item in dependencies):
             raise ValueError("depends_on must be a list of dataset ids")
-        if len(set(dependencies)) != len(dependencies) or any(item not in records for item in dependencies):
+        if len(set(dependencies)) != len(dependencies) or any(item not in known_ids for item in dependencies):
             raise ValueError("dependencies must be unique, already registered dataset ids")
         entry = {"id": identifier, "description": str(dataset.get("description", "")),
                  "fields": [{"name": field["name"], "type": field["type"]} for field in fields],
                  "depends_on": sorted(dependencies)}
         if "tags" in dataset:
             entry["tags"] = _normalize_tags(dataset["tags"])
+        return entry
+
+    def register(self, dataset):
+        records = self.entries()
+        if not isinstance(dataset, dict):
+            raise ValueError("invalid dataset descriptor")
+        identifier = dataset.get("id")
+        if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
+            raise ValueError("invalid dataset id")
+        if identifier in records:
+            raise ValueError("dataset already registered")
+        entry = self._normalize_entry(dataset, set(records))
         records[identifier] = entry
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -196,12 +205,65 @@ class DatasetCatalog:
             raise ValueError("dependency cycle detected")
         return {"datasets": [records[key] for key in ordered]}
 
+    def import_bundle(self, bundle):
+        if not isinstance(bundle, dict):
+            raise ValueError("bundle must be an object")
+        descriptors = bundle.get("datasets")
+        if not isinstance(descriptors, list):
+            raise ValueError("bundle must contain a datasets array")
+
+        records = self.entries()
+        batch_ids = set()
+        for dataset in descriptors:
+            if not isinstance(dataset, dict):
+                raise ValueError("invalid dataset descriptor")
+            identifier = dataset.get("id")
+            if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
+                raise ValueError("invalid dataset id")
+            if identifier in records or identifier in batch_ids:
+                raise ValueError("dataset already registered")
+            batch_ids.add(identifier)
+
+        known = set(records) | batch_ids
+        new_entries = {}
+        for dataset in descriptors:
+            entry = self._normalize_entry(dataset, known)
+            if entry["id"] in entry["depends_on"]:
+                raise ValueError("dependencies must be unique, already registered dataset ids")
+            new_entries[entry["id"]] = entry
+
+        remaining = {key: set(entry["depends_on"]) & batch_ids
+                     for key, entry in new_entries.items()}
+        ready = [key for key, deps in remaining.items() if not deps]
+        heapq.heapify(ready)
+        ordered = []
+        while ready:
+            key = heapq.heappop(ready)
+            ordered.append(key)
+            for other, deps in remaining.items():
+                if key in deps:
+                    deps.remove(key)
+                    if not deps:
+                        heapq.heappush(ready, other)
+        if len(ordered) != len(new_entries):
+            raise ValueError("dependency cycle detected")
+
+        imported = [new_entries[key] for key in ordered]
+        if new_entries:
+            for entry in imported:
+                records[entry["id"]] = entry
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n",
+                                 encoding="utf-8")
+        return {"datasets": imported}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--catalog", default="samples/catalog.json")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("register").add_argument("file")
+    commands.add_parser("import", help="import a bundle of dataset metadata").add_argument("file")
     commands.add_parser("describe").add_argument("id")
     commands.add_parser("dependencies").add_argument("id")
     impact = commands.add_parser("impact")
@@ -218,6 +280,8 @@ def main():
         catalog = DatasetCatalog(args.catalog)
         if args.command == "register":
             result = catalog.register(json.loads(Path(args.file).read_text(encoding="utf-8")))
+        elif args.command == "import":
+            result = catalog.import_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "export":
             result = catalog.export(None if args.ids is None else args.ids)
         elif args.command == "impact":
