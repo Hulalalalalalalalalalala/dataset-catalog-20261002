@@ -258,12 +258,71 @@ class DatasetCatalog:
         return {"datasets": imported}
 
 
+    def diff_bundle(self, bundle):
+        if not isinstance(bundle, dict):
+            raise ValueError("bundle must be an object")
+        descriptors = bundle.get("datasets")
+        if not isinstance(descriptors, list):
+            raise ValueError("bundle must contain a datasets array")
+
+        batch_ids = set()
+        for dataset in descriptors:
+            if not isinstance(dataset, dict):
+                raise ValueError("invalid dataset descriptor")
+            identifier = dataset.get("id")
+            if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
+                raise ValueError("invalid dataset id")
+            if identifier in batch_ids:
+                raise ValueError("duplicate dataset id in snapshot")
+            batch_ids.add(identifier)
+
+        snapshot = {}
+        for dataset in descriptors:
+            entry = self._normalize_entry(dataset, batch_ids)
+            if entry["id"] in entry["depends_on"]:
+                raise ValueError("dependencies must be unique dataset ids within the snapshot")
+            snapshot[entry["id"]] = entry
+
+        remaining = {key: set(entry["depends_on"]) for key, entry in snapshot.items()}
+        ready = [key for key, deps in remaining.items() if not deps]
+        heapq.heapify(ready)
+        ordered = []
+        while ready:
+            key = heapq.heappop(ready)
+            ordered.append(key)
+            for other, deps in remaining.items():
+                if key in deps:
+                    deps.remove(key)
+                    if not deps:
+                        heapq.heappush(ready, other)
+        if len(ordered) != len(snapshot):
+            raise ValueError("dependency cycle detected")
+
+        records = self.entries()
+        added = [snapshot[key] for key in sorted(snapshot) if key not in records]
+        removed = [records[key] for key in sorted(records) if key not in snapshot]
+        missing = object()
+        changed = []
+        for key in sorted(snapshot):
+            if key not in records:
+                continue
+            before = records[key]
+            after = snapshot[key]
+            changed_keys = sorted(name for name in set(before) | set(after) if name != "id"
+                                  and before.get(name, missing) != after.get(name, missing))
+            if changed_keys:
+                changed.append({"id": key, "before": before, "after": after,
+                                "changed_keys": changed_keys})
+        return {"added": added, "removed": removed, "changed": changed}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--catalog", default="samples/catalog.json")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("register").add_argument("file")
     commands.add_parser("import", help="import a bundle of dataset metadata").add_argument("file")
+    commands.add_parser("diff", help="diff the catalog against a snapshot bundle").add_argument("file")
     commands.add_parser("describe").add_argument("id")
     commands.add_parser("dependencies").add_argument("id")
     impact = commands.add_parser("impact")
@@ -282,6 +341,8 @@ def main():
             result = catalog.register(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "import":
             result = catalog.import_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
+        elif args.command == "diff":
+            result = catalog.diff_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "export":
             result = catalog.export(None if args.ids is None else args.ids)
         elif args.command == "impact":
