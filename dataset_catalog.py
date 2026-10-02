@@ -593,6 +593,35 @@ class DatasetCatalog:
                             "breaking": breaking})
         return {"changes": changes}
 
+    @staticmethod
+    def _relation_pairs(state):
+        downstream = _downstream_index(state)
+        pairs = {}
+        for source in state:
+            for target, path in _shortest_downstream_paths(downstream, source).items():
+                pairs[(source, target)] = {"distance": len(path) - 1, "path": path}
+        return pairs
+
+    def relation_diff_bundle(self, bundle):
+        snapshot = self._snapshot_state(bundle)
+        current = self._current_state()
+        before = self._relation_pairs(current)
+        after = self._relation_pairs(snapshot)
+        added = []
+        removed = []
+        changed = []
+        for source, target in sorted(set(before) | set(after)):
+            prior = before.get((source, target))
+            follow = after.get((source, target))
+            item = {"source": source, "target": target, "before": prior, "after": follow}
+            if prior is None:
+                added.append(item)
+            elif follow is None:
+                removed.append(item)
+            elif prior != follow:
+                changed.append(item)
+        return {"added": added, "removed": removed, "changed": changed}
+
     def schema_diff_bundle(self, bundle):
         snapshot = self._snapshot_state(bundle)
         current = self._current_state()
@@ -649,6 +678,10 @@ def main():
                         help="review read-only field additions, removals and type changes against "
                              "a complete snapshot bundle"
                         ).add_argument("file")
+    commands.add_parser("relation-diff",
+                        help="review read-only transitive dependency relation changes against "
+                             "a complete snapshot bundle"
+                        ).add_argument("file")
     apply_cmd = commands.add_parser("apply",
                                     help="apply a snapshot bundle as the complete catalog state")
     apply_cmd.add_argument("file")
@@ -692,6 +725,8 @@ def main():
             result = catalog.preview_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "schema-diff":
             result = catalog.schema_diff_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
+        elif args.command == "relation-diff":
+            result = catalog.relation_diff_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "apply":
             bundle = json.loads(Path(args.file).read_text(encoding="utf-8"))
             if args.expected is None:

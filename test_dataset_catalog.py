@@ -2216,6 +2216,284 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("error", json.loads(run.stdout))
         self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
 
+    def test_relation_diff_structure_and_direction(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"])]})
+        bundle = {"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("c", ["b"])]}
+        result = self.catalog.relation_diff_bundle(bundle)
+        self.assertEqual(set(result), {"added", "removed", "changed"})
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["changed"], [])
+        # B depends on A is the relation A -> B, both ends included in the path
+        self.assertEqual(result["added"], [
+            {"source": "a", "target": "c", "before": None,
+             "after": {"distance": 2, "path": ["a", "b", "c"]}},
+            {"source": "b", "target": "c", "before": None,
+             "after": {"distance": 1, "path": ["b", "c"]}}])
+        for row in result["added"]:
+            self.assertEqual(set(row), {"source", "target", "before", "after"})
+
+    def test_relation_diff_removed_pair_when_middle_record_deleted(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("c", ["b"])]})
+        result = self.catalog.relation_diff_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("c")]})
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["removed"], [
+            {"source": "a", "target": "b", "after": None,
+             "before": {"distance": 1, "path": ["a", "b"]}},
+            {"source": "a", "target": "c", "after": None,
+             "before": {"distance": 2, "path": ["a", "b", "c"]}},
+            {"source": "b", "target": "c", "after": None,
+             "before": {"distance": 1, "path": ["b", "c"]}}])
+
+    def test_relation_diff_changed_when_shortest_explanation_changes(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("c", ["b"])]})
+        # a new direct edge shortens a -> c from 2 to 1
+        result = self.catalog.relation_diff_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("c", ["a", "b"])]})
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["changed"], [
+            {"source": "a", "target": "c",
+             "before": {"distance": 2, "path": ["a", "b", "c"]},
+             "after": {"distance": 1, "path": ["a", "c"]}}])
+
+    def test_relation_diff_changed_on_equal_distance_path_tie_break(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("c", ["a"]), self._snapshot_record("d", ["b", "c"])]})
+        # after the change only the a -> c -> d route remains at distance 2
+        result = self.catalog.relation_diff_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("c", ["a"]), self._snapshot_record("d", ["c"])]})
+        self.assertEqual(result["changed"], [
+            {"source": "a", "target": "d",
+             "before": {"distance": 2, "path": ["a", "b", "d"]},
+             "after": {"distance": 2, "path": ["a", "c", "d"]}}])
+        self.assertEqual(result["removed"],
+                         [{"source": "b", "target": "d", "after": None,
+                           "before": {"distance": 1, "path": ["b", "d"]}}])
+        self.assertEqual(result["added"], [])
+
+    def test_relation_diff_ignores_metadata_and_non_shortest_path_changes(self):
+        records = {"datasets": [
+            self._snapshot_record("a", tags=["t"], description="first"),
+            {**self._snapshot_record("b", ["a"]), "owner": "team"},
+            self._snapshot_record("c", ["a", "b"])]}
+        self.catalog.import_bundle(records)
+        # field, description, tag and owner changes never produce relation records
+        metadata_only = {"datasets": [
+            self._snapshot_record("a", tags=["u"], description="second",
+                                  fields=[{"name": "m", "type": "string"}]),
+            {**self._snapshot_record("b", ["a"]), "owner": "other"},
+            self._snapshot_record("c", ["a", "b"])]}
+        self.assertEqual(self.catalog.relation_diff_bundle(metadata_only),
+                         {"added": [], "removed": [], "changed": []})
+        # dropping the x -> d edge leaves the shortest a -> d explanation untouched,
+        # so only the edge's own endpoint pair is reported
+        other = DatasetCatalog(Path(self.temp.name) / "alt-path.json")
+        other.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("x", ["a"]), self._snapshot_record("d", ["b", "x"])]})
+        result = other.relation_diff_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("x", ["a"]), self._snapshot_record("d", ["b"])]})
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["removed"],
+                         [{"source": "x", "target": "d", "after": None,
+                           "before": {"distance": 1, "path": ["x", "d"]}}])
+
+    def test_relation_diff_isolated_records_produce_no_relations(self):
+        self.catalog.import_bundle({"datasets": [self._snapshot_record("a")]})
+        result = self.catalog.relation_diff_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("lonely")]})
+        self.assertEqual(result, {"added": [], "removed": [], "changed": []})
+        result = self.catalog.relation_diff_bundle({"datasets": []})
+        self.assertEqual(result, {"added": [], "removed": [], "changed": []})
+
+    def test_relation_diff_empty_arrays_when_nothing_changes(self):
+        bundle = {"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"])]}
+        self.catalog.import_bundle(bundle)
+        self.assertEqual(self.catalog.relation_diff_bundle(bundle),
+                         {"added": [], "removed": [], "changed": []})
+
+    def test_relation_diff_sorted_and_independent_of_input_order(self):
+        self.catalog.import_bundle({"datasets": [self._snapshot_record("z")]})
+        bundle = {"datasets": [
+            self._snapshot_record("c", ["b", "a"]), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("a"), self._snapshot_record("z")]}
+        result = self.catalog.relation_diff_bundle(bundle)
+        keys = [(row["source"], row["target"]) for row in result["added"]]
+        self.assertEqual(keys, sorted(keys))
+        self.assertEqual(keys, [("a", "b"), ("a", "c"), ("b", "c")])
+        shuffled = {"datasets": list(reversed(bundle["datasets"]))}
+        self.assertEqual(self.catalog.relation_diff_bundle(shuffled), result)
+
+    def test_relation_diff_missing_or_empty_catalog_and_empty_snapshot(self):
+        self.assertFalse(self.path.exists())
+        result = self.catalog.relation_diff_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"])]})
+        self.assertEqual(result["added"], [
+            {"source": "a", "target": "b", "before": None,
+             "after": {"distance": 1, "path": ["a", "b"]}}])
+        self.assertFalse(self.path.exists())
+
+        self.path.write_text("{}", encoding="utf-8")
+        self.assertEqual(DatasetCatalog(self.path).relation_diff_bundle({"datasets": []}),
+                         {"added": [], "removed": [], "changed": []})
+
+        # an empty snapshot deletes every record, so every relation disappears
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"])]})
+        result = self.catalog.relation_diff_bundle({"datasets": []})
+        self.assertEqual(result["removed"], [
+            {"source": "a", "target": "b", "after": None,
+             "before": {"distance": 1, "path": ["a", "b"]}}])
+
+    def test_relation_diff_validates_both_graphs_even_without_relation_changes(self):
+        self.catalog.register(self._snapshot_record("old"))
+        bad_bundles = [
+            [], None, "x", 1, True, {},
+            {"datasets": None}, {"datasets": {}}, {"datasets": "x"},
+            {"datasets": [None]},
+            {"datasets": [{"id": "bad id", "fields": [{"name": "n", "type": "integer"}]}]},
+            {"datasets": [{"id": "a"}]},
+            {"datasets": [self._snapshot_record("a"), self._snapshot_record("a")]},
+            {"datasets": [self._snapshot_record("a", ["a"])]},
+            {"datasets": [self._snapshot_record("a", ["b", "b"])]},
+            {"datasets": [self._snapshot_record("a", ["ghost"])]},
+            {"datasets": [self._snapshot_record("a", ["b"]), self._snapshot_record("b", ["a"])]},
+        ]
+        for bundle in bad_bundles:
+            with self.assertRaises(ValueError):
+                self.catalog.relation_diff_bundle(bundle)
+
+        # validation runs even when the snapshot would not change any relation
+        same_relations = {"datasets": [self._snapshot_record("old", description="other")]}
+        for raw in (
+                json.dumps([self._snapshot_record("old")]),
+                json.dumps({"old": "x"}),
+                json.dumps({"old": self._snapshot_record("old", ["ghost"])}),
+                json.dumps({"old": self._snapshot_record("old", ["old"])}),
+                json.dumps({"old": self._snapshot_record("old", ["b", "b"]),
+                            "b": self._snapshot_record("b")}),
+                json.dumps({"old": {**self._snapshot_record("old"), "id": "other"}}),
+                json.dumps({"old": self._snapshot_record("old", ["b"]),
+                            "b": self._snapshot_record("b", ["old"])})):
+            other = Path(self.temp.name) / "bad-relation-catalog.json"
+            other.write_text(raw, encoding="utf-8")
+            with self.assertRaises(ValueError):
+                DatasetCatalog(other).relation_diff_bundle(same_relations)
+
+    def test_relation_diff_does_not_mutate_inputs_or_write_files(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"])]})
+        catalog_before = self.path.read_text(encoding="utf-8")
+        bundle = {"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("c", ["b"])], "ignored": True}
+        snapshot = json.loads(json.dumps(bundle))
+        result = self.catalog.relation_diff_bundle(bundle)
+        self.assertEqual(bundle, snapshot)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+        result["added"][0]["after"]["path"].append("tampered")
+        result["added"][0]["after"]["distance"] = 99
+        again = self.catalog.relation_diff_bundle(bundle)
+        self.assertEqual(again["added"][0]["after"],
+                         {"distance": 2, "path": ["a", "b", "c"]})
+
+        nested = Path(self.temp.name) / "state" / "nested" / "catalog.json"
+        empty_catalog = DatasetCatalog(nested)
+        self.assertEqual(empty_catalog.relation_diff_bundle({"datasets": []}),
+                         {"added": [], "removed": [], "changed": []})
+        self.assertFalse(nested.exists())
+        self.assertFalse(nested.parent.exists())
+
+    def test_cli_relation_diff_success_and_errors(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")],
+                       check=True, capture_output=True)
+        subprocess.run(prefix + ["register", str(ROOT / "samples/daily.json")],
+                       check=True, capture_output=True)
+        catalog_before = self.path.read_text(encoding="utf-8")
+
+        snapshot_path = Path(self.temp.name) / "snapshot.json"
+        snapshot_path.write_text(json.dumps({"datasets": [
+            {"id": "orders", "description": "Order amounts from the daily export",
+             "fields": [{"name": "order_id", "type": "string"},
+                        {"name": "amount", "type": "number"}], "depends_on": []},
+            {"id": "daily_totals", "description": "same fields, new description",
+             "fields": [{"name": "day", "type": "string"}, {"name": "total", "type": "number"}],
+             "depends_on": ["orders"]},
+            {"id": "report", "description": "new",
+             "fields": [{"name": "id", "type": "string"}], "depends_on": ["daily_totals"]}]},
+            ensure_ascii=False), encoding="utf-8")
+        run = subprocess.run(prefix + ["relation-diff", str(snapshot_path)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual(set(result), {"added", "removed", "changed"})
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["added"], [
+            {"source": "daily_totals", "target": "report", "before": None,
+             "after": {"distance": 1, "path": ["daily_totals", "report"]}},
+            {"source": "orders", "target": "report", "before": None,
+             "after": {"distance": 2, "path": ["orders", "daily_totals", "report"]}}])
+        self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+
+        # a description-only change exits 0 with three empty arrays
+        only_metadata = Path(self.temp.name) / "metadata.json"
+        only_metadata.write_text(json.dumps({"datasets": [
+            {"id": "orders", "description": "changed",
+             "fields": [{"name": "order_id", "type": "string"},
+                        {"name": "amount", "type": "number"}], "depends_on": []},
+            {"id": "daily_totals", "description": "Daily totals derived from orders",
+             "fields": [{"name": "day", "type": "string"}, {"name": "total", "type": "number"}],
+             "depends_on": ["orders"]}]}), encoding="utf-8")
+        run = subprocess.run(prefix + ["relation-diff", str(only_metadata)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout),
+                         {"added": [], "removed": [], "changed": []})
+
+        invalid_shape = subprocess.run(prefix + ["relation-diff", str(ROOT / "samples" / "orders.json")],
+                                       capture_output=True, text=True)
+        self.assertEqual(invalid_shape.returncode, 2)
+        self.assertIn("error", json.loads(invalid_shape.stdout))
+
+        missing = subprocess.run(prefix + ["relation-diff", str(Path(self.temp.name) / "nope.json")],
+                                 capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stdout))
+
+        bad_json = Path(self.temp.name) / "bad.json"
+        bad_json.write_text("{not json", encoding="utf-8")
+        run = subprocess.run(prefix + ["relation-diff", str(bad_json)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+
+        invalid = Path(self.temp.name) / "invalid.json"
+        invalid.write_text(json.dumps({"datasets": [
+            {"id": "a", "fields": [{"name": "n", "type": "integer"}], "depends_on": ["a"]}]}),
+            encoding="utf-8")
+        run = subprocess.run(prefix + ["relation-diff", str(invalid)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+        self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+
 
 if __name__ == "__main__":
     unittest.main()
