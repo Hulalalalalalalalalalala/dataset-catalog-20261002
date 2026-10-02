@@ -1,10 +1,13 @@
 """Register dataset schemas and inspect their direct dependencies."""
 import argparse
 import copy
+import csv
 import heapq
+import io
 import json
 import os
 import re
+import sys
 import tempfile
 from pathlib import Path
 
@@ -144,6 +147,31 @@ def _validated_upstream_closure(records, start):
     known_ids = set(records)
     closure = {}
     stack = [start]
+    while stack:
+        key = stack.pop()
+        if key in closure:
+            continue
+        entry = _normalized_record(records[key], known_ids)
+        if entry["id"] != key:
+            raise ValueError("invalid dataset descriptor")
+        if entry["id"] in entry["depends_on"]:
+            raise ValueError("dependencies must be unique, already registered dataset ids")
+        closure[key] = entry
+        stack.extend(entry["depends_on"])
+    if _toposort(closure) is None:
+        raise ValueError("dependency cycle detected")
+    return closure
+
+
+CSV_HEADER = ("dataset_id", "description", "owner", "tags", "depends_on",
+              "field_name", "field_type")
+
+
+def _validated_upstream_closure_many(records, starts):
+    """Normalize every start and its reachable upstream records as one subgraph."""
+    known_ids = set(records)
+    closure = {}
+    stack = list(starts)
     while stack:
         key = stack.pop()
         if key in closure:
@@ -407,6 +435,41 @@ class DatasetCatalog:
         if ordered is None:
             raise ValueError("dependency cycle detected")
         return {"datasets": [records[key] for key in ordered]}
+
+    def export_csv(self, identifiers=None):
+        if identifiers is not None and not isinstance(identifiers, list):
+            raise ValueError("identifiers must be None or a list of dataset ids")
+        selected = []
+        if identifiers is not None:
+            for item in identifiers:
+                if not isinstance(item, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", item):
+                    raise ValueError("invalid dataset id")
+                if item not in selected:
+                    selected.append(item)
+        records = self.entries()
+        if not isinstance(records, dict):
+            raise ValueError("invalid catalog state")
+        unknown = [item for item in selected if item not in records]
+        if unknown:
+            raise ValueError("unknown dataset")
+        if identifiers is None:
+            selected = list(records)
+
+        closure = _validated_upstream_closure_many(records, selected)
+        ordered = _toposort(closure)
+
+        output = io.StringIO()
+        writer = csv.writer(output, lineterminator="\n")
+        writer.writerow(CSV_HEADER)
+        for key in ordered:
+            entry = closure[key]
+            owner = entry.get("owner", "")
+            tags = json.dumps(entry.get("tags", []), ensure_ascii=False, separators=(",", ":"))
+            depends_on = json.dumps(entry["depends_on"], ensure_ascii=False, separators=(",", ":"))
+            for field in entry["fields"]:
+                writer.writerow([entry["id"], entry["description"], owner, tags, depends_on,
+                                 field["name"], field["type"]])
+        return output.getvalue()
 
     def import_bundle(self, bundle):
         if not isinstance(bundle, dict):
@@ -698,6 +761,11 @@ def main():
     upstream.add_argument("--max-depth")
     export = commands.add_parser("export")
     export.add_argument("--id", action="append", dest="ids")
+    export_csv = commands.add_parser(
+        "export-csv",
+        help="export the selected datasets and their upstream closure as a field-level CSV "
+             "data dictionary")
+    export_csv.add_argument("--id", action="append", dest="ids")
     common_upstream = commands.add_parser(
         "common-upstream",
         help="find the common upstream datasets shared by repeated --id targets")
@@ -738,6 +806,9 @@ def main():
                 result = catalog.apply_bundle(bundle, expected)
         elif args.command == "export":
             result = catalog.export(None if args.ids is None else args.ids)
+        elif args.command == "export-csv":
+            sys.stdout.write(catalog.export_csv(None if args.ids is None else args.ids))
+            return 0
         elif args.command == "common-upstream":
             result = catalog.common_upstream([] if args.ids is None else args.ids)
         elif args.command == "between":
