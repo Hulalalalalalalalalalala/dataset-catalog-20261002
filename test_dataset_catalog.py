@@ -619,13 +619,15 @@ class CatalogTests(unittest.TestCase):
 
 
     def _snapshot_record(self, identifier, depends_on=None, tags=..., description=...,
-                         fields=None):
+                         fields=None, owner=...):
         record = {"id": identifier,
                   "description": identifier + " desc" if description is ... else description,
                   "fields": fields or [{"name": "n", "type": "integer"}],
                   "depends_on": depends_on or []}
         if tags is not ... and tags is not None:
             record["tags"] = tags
+        if owner is not ...:
+            record["owner"] = owner
         return record
 
     def test_diff_lists_added_removed_and_changed_sorted_by_id(self):
@@ -1070,6 +1072,196 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(run.returncode, 2)
         self.assertIn("error", json.loads(run.stdout))
         self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+
+
+    def test_register_normalizes_and_persists_owner(self):
+        entry = self.catalog.register({**self.raw, "owner": "  Jane  Q "})
+        self.assertEqual(entry["owner"], "Jane  Q")
+        fresh = DatasetCatalog(self.path)
+        self.assertEqual(fresh.describe("orders")["owner"], "Jane  Q")
+        plain = self.catalog.register({"id": "plain", "fields": [{"name": "n", "type": "integer"}]})
+        self.assertNotIn("owner", plain)
+        self.assertNotIn("owner", DatasetCatalog(self.path).describe("plain"))
+        unicode = self.catalog.register({"id": "u", "fields": [{"name": "n", "type": "integer"}],
+                                         "owner": "日 本　"})
+        self.assertEqual(unicode["owner"], "日 本")
+
+    def test_register_rejects_invalid_owner_without_writing(self):
+        for bad in (None, 1, True, ["Jane"], {"name": "Jane"}, "", "   ", "\t \n"):
+            with self.assertRaises(ValueError):
+                self.catalog.register({**self.raw, "owner": bad})
+        self.assertFalse(self.path.exists())
+        self.catalog.register(self.raw)
+        before = self.path.read_text(encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.catalog.register({"id": "other", "fields": [{"name": "n", "type": "integer"}],
+                                   "owner": " "})
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def _owner_records(self):
+        return {
+            "a": {"id": "a", "description": "alpha report",
+                  "fields": [{"name": "n", "type": "integer"}], "depends_on": [],
+                  "tags": ["Finance"], "owner": "Jane Q"},
+            "b": {"id": "b", "description": "beta",
+                  "fields": [{"name": "label", "type": "string"}], "depends_on": [],
+                  "owner": "JANE q"},
+            "legacy": {"id": "legacy", "description": "no owner",
+                       "fields": [{"name": "n", "type": "integer"}], "depends_on": []}}
+
+    def test_search_owner_full_casefold_match(self):
+        self._write_records(self._owner_records())
+        self.assertEqual([row["dataset"]["id"] for row in self.catalog.search(owner="jane q")],
+                         ["a", "b"])
+        self.assertEqual([row["dataset"]["id"] for row in self.catalog.search(owner="  jane q  ")],
+                         ["a", "b"])
+        self.assertEqual([row["dataset"]["id"] for row in self.catalog.search(owner="Jane Q")],
+                         ["a", "b"])
+        self.assertEqual(self.catalog.search(owner="jane"), [])
+        self.assertEqual(self.catalog.search(owner="jane  q"), [])
+        self.assertEqual(self.catalog.search(owner="jane q extra"), [])
+        self.assertEqual(self.catalog.search(owner="nobody"), [])
+        self.assertEqual([row["dataset"]["id"] for row in self.catalog.search(owner=None)],
+                         ["a", "b", "legacy"])
+
+    def test_search_owner_combines_with_other_conditions(self):
+        self._write_records(self._owner_records())
+        result = self.catalog.search("alpha", owner="jane q")
+        self.assertEqual([row["dataset"]["id"] for row in result], ["a"])
+        result = self.catalog.search("beta", owner="jane q")
+        self.assertEqual([row["dataset"]["id"] for row in result], ["b"])
+        result = self.catalog.search(field_type="string", owner="jane q")
+        self.assertEqual([row["dataset"]["id"] for row in result], ["b"])
+        result = self.catalog.search(tags=["finance"], owner="jane q")
+        self.assertEqual([row["dataset"]["id"] for row in result], ["a"])
+        result = self.catalog.search("alpha", field_type="integer", tags=["finance"], owner="JANE Q")
+        self.assertEqual([row["dataset"]["id"] for row in result], ["a"])
+        result = self.catalog.search("alpha", owner="nobody")
+        self.assertEqual(result, [])
+        # owner text is not part of the keyword scope or matched_fields
+        result = self.catalog.search("jane")
+        self.assertEqual(result, [])
+        result = self.catalog.search("alpha", owner="jane q")
+        self.assertEqual(result[0]["matched_fields"], [])
+
+    def test_search_validates_owner_before_reading_catalog(self):
+        self.assertFalse(self.path.exists())
+        for bad in ("", "   ", 1, True, ["jane"], 0):
+            with self.assertRaises(ValueError):
+                self.catalog.search(owner=bad)
+        self.assertEqual(self.catalog.search(owner="jane q"), [])
+        self.assertFalse(self.path.exists())
+
+    def test_search_owner_does_not_modify_catalog(self):
+        self._write_records(self._owner_records())
+        before = self.path.read_text(encoding="utf-8")
+        self.catalog.search(owner="jane q")
+        self.catalog.search(owner="nobody")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+        self.assertNotIn("owner", self.catalog.describe("legacy"))
+
+    def test_owner_survives_export_and_import_roundtrip(self):
+        self._write_records(self._owner_records())
+        bundle = self.catalog.export()
+        other_path = self.path.parent / "rebuilt.json"
+        rebuilt = DatasetCatalog(other_path)
+        result = rebuilt.import_bundle(bundle)
+        saved = {row["id"]: row for row in result["datasets"]}
+        self.assertEqual(saved["a"]["owner"], "Jane Q")
+        self.assertEqual(saved["b"]["owner"], "JANE q")
+        self.assertNotIn("owner", saved["legacy"])
+        for identifier in ("a", "b", "legacy"):
+            self.assertEqual(rebuilt.describe(identifier), self.catalog.describe(identifier))
+
+    def test_import_rejects_invalid_owner_batch_without_writing(self):
+        good = {"id": "ok", "fields": [{"name": "n", "type": "integer"}]}
+        bad_bundles = [
+            {"datasets": [good, {**good, "id": "bad", "owner": ""}]},
+            {"datasets": [{**good, "id": "bad", "owner": None}]},
+            {"datasets": [{**good, "id": "bad", "owner": 1}]},
+            {"datasets": [{**good, "id": "bad", "owner": "   "}]},
+        ]
+        for bundle in bad_bundles:
+            with self.assertRaises(ValueError):
+                self.catalog.import_bundle(bundle)
+        self.assertFalse(self.path.exists())
+        snapshot = {"datasets": [{**good, "id": "x", "owner": " A "}]}
+        snap = json.loads(json.dumps(snapshot))
+        result = self.catalog.import_bundle(snapshot)
+        self.assertEqual(result["datasets"][0]["owner"], "A")
+        self.assertEqual(snapshot, snap)
+
+    def test_diff_detects_owner_changes_with_whitespace_normalization(self):
+        self.catalog.register({"id": "a", "fields": [{"name": "n", "type": "integer"}],
+                               "owner": " Alice "})
+        same = {"datasets": [{"id": "a", "fields": [{"name": "n", "type": "integer"}],
+                              "owner": "Alice"}]}
+        self.assertEqual(self.catalog.diff_bundle(same)["changed"], [])
+        for after_owner, expected in ((None, ["owner"]), ("Bob", ["owner"]),
+                                      ("alice", ["owner"])):
+            record = {"id": "a", "fields": [{"name": "n", "type": "integer"}]}
+            if after_owner is not None:
+                record["owner"] = after_owner
+            changed = self.catalog.diff_bundle({"datasets": [record]})["changed"]
+            self.assertEqual([row["changed_keys"] for row in changed], [expected])
+        # adding an owner where none existed
+        plain = DatasetCatalog(self.path.parent / "plain.json")
+        plain.register({"id": "a", "fields": [{"name": "n", "type": "integer"}]})
+        changed = plain.diff_bundle(same)["changed"]
+        self.assertEqual([row["changed_keys"] for row in changed], [["owner"]])
+        self.assertNotIn("owner", changed[0]["before"])
+        self.assertEqual(changed[0]["after"]["owner"], "Alice")
+
+    def test_diff_and_preview_reject_invalid_owner(self):
+        self.catalog.register({"id": "a", "fields": [{"name": "n", "type": "integer"}]})
+        for bad in (None, "", "   ", 1, ["x"]):
+            record = {"id": "a", "fields": [{"name": "n", "type": "integer"}], "owner": bad}
+            with self.assertRaises(ValueError):
+                self.catalog.diff_bundle({"datasets": [record]})
+            with self.assertRaises(ValueError):
+                self.catalog.preview_bundle({"datasets": [record]})
+
+    def test_preview_owner_only_change_propagates(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("c", ["b"])]})
+        result = self.catalog.preview_bundle({"datasets": [
+            self._snapshot_record("a", owner="Alice"), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("c", ["b"])]})
+        self.assertEqual([row["changed_keys"] for row in result["diff"]["changed"]], [["owner"]])
+        self.assertEqual([item["id"] for item in result["affected"]], ["b", "c"])
+        self.assertEqual(result["affected"][0]["causes"][0]["id"], "a")
+
+    def test_cli_search_owner_filter(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        first = {"id": "a", "description": "alpha",
+                 "fields": [{"name": "n", "type": "integer"}], "owner": "Jane Q"}
+        second = {"id": "b", "description": "beta",
+                  "fields": [{"name": "n", "type": "integer"}]}
+        for row in (first, second):
+            descriptor = Path(self.temp.name) / (row["id"] + ".json")
+            descriptor.write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
+            run = subprocess.run(prefix + ["register", str(descriptor)],
+                                 capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+        run = subprocess.run(prefix + ["search", "--owner", "jane q"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual([row["dataset"]["id"] for row in json.loads(run.stdout)], ["a"])
+        run = subprocess.run(prefix + ["search", "alpha", "--owner", "JANE Q"],
+                             capture_output=True, text=True)
+        self.assertEqual([row["dataset"]["id"] for row in json.loads(run.stdout)], ["a"])
+        run = subprocess.run(prefix + ["search", "--owner", "jane"],
+                             capture_output=True, text=True)
+        self.assertEqual(json.loads(run.stdout), [])
+        run = subprocess.run(prefix + ["search"], capture_output=True, text=True)
+        self.assertEqual([row["dataset"]["id"] for row in json.loads(run.stdout)], ["a", "b"])
+        bad = subprocess.run(prefix + ["search", "--owner", "   "],
+                             capture_output=True, text=True)
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("error", json.loads(bad.stdout))
+        described = subprocess.run(prefix + ["describe", "a"], capture_output=True, text=True)
+        self.assertEqual(json.loads(described.stdout)["owner"], "Jane Q")
 
 
 if __name__ == "__main__":
