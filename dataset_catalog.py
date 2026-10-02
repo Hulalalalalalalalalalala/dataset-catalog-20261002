@@ -1,5 +1,6 @@
 """Register dataset schemas and inspect their direct dependencies."""
 import argparse
+import heapq
 import json
 import re
 from pathlib import Path
@@ -84,6 +85,56 @@ class DatasetCatalog:
         result.sort(key=lambda item: (item["distance"], item["dataset"]["id"]))
         return result
 
+    def export(self, identifiers=None):
+        if identifiers is not None:
+            if not isinstance(identifiers, list):
+                raise ValueError("identifiers must be None or a list of dataset ids")
+            if any(not isinstance(item, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", item)
+                   for item in identifiers):
+                raise ValueError("identifiers must be valid dataset ids")
+        records = self.entries()
+        if identifiers is None:
+            selected = set(records)
+        else:
+            selected = set(identifiers)
+            unknown = selected - records.keys()
+            if unknown:
+                raise ValueError("unknown dataset")
+        included = set()
+
+        def collect(identifier):
+            if identifier in included:
+                return
+            included.add(identifier)
+            for dependency in records[identifier]["depends_on"]:
+                if dependency not in records:
+                    raise ValueError("missing dependency")
+                collect(dependency)
+
+        for identifier in selected:
+            collect(identifier)
+        ready = []
+        remaining = {}
+        dependents = {key: [] for key in included}
+        for key in included:
+            deps = set(records[key]["depends_on"]) & included
+            remaining[key] = deps
+            if not deps:
+                heapq.heappush(ready, key)
+            for dependency in deps:
+                dependents[dependency].append(key)
+        ordered = []
+        while ready:
+            key = heapq.heappop(ready)
+            ordered.append(records[key])
+            for dependent in dependents[key]:
+                remaining[dependent].discard(key)
+                if not remaining[dependent]:
+                    heapq.heappush(ready, dependent)
+        if len(ordered) != len(included):
+            raise ValueError("dependency cycle")
+        return {"datasets": ordered}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -95,6 +146,8 @@ def main():
     impact = commands.add_parser("impact")
     impact.add_argument("id")
     impact.add_argument("--max-depth")
+    export = commands.add_parser("export")
+    export.add_argument("--id", action="append", dest="ids")
     args = parser.parse_args()
     try:
         catalog = DatasetCatalog(args.catalog)
@@ -109,6 +162,8 @@ def main():
             else:
                 max_depth = None
             result = catalog.impact(args.id, max_depth=max_depth)
+        elif args.command == "export":
+            result = catalog.export(args.ids)
         else:
             result = getattr(catalog, args.command)(args.id)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
