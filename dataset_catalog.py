@@ -78,6 +78,104 @@ def _toposort(entries):
     return ordered if len(ordered) == len(entries) else None
 
 
+def _normalized_snapshot(bundle):
+    """Validate a complete-snapshot bundle and return its normalized records."""
+    if not isinstance(bundle, dict):
+        raise ValueError("bundle must be an object")
+    descriptors = bundle.get("datasets")
+    if not isinstance(descriptors, list):
+        raise ValueError("bundle must contain a datasets array")
+
+    snapshot_ids = set()
+    for dataset in descriptors:
+        if not isinstance(dataset, dict):
+            raise ValueError("invalid dataset descriptor")
+        identifier = dataset.get("id")
+        if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
+            raise ValueError("invalid dataset id")
+        if identifier in snapshot_ids:
+            raise ValueError("dataset already registered")
+        snapshot_ids.add(identifier)
+
+    snapshot = {}
+    for dataset in descriptors:
+        entry = _normalized_record(dataset, snapshot_ids)
+        if entry["id"] in entry["depends_on"]:
+            raise ValueError("dependencies must be unique, already registered dataset ids")
+        snapshot[entry["id"]] = entry
+    if _toposort(snapshot) is None:
+        raise ValueError("dependency cycle detected")
+    return snapshot
+
+
+def _normalized_catalog(records):
+    """Validate the persisted catalog as a self-contained dependency graph."""
+    if not isinstance(records, dict):
+        raise ValueError("invalid catalog")
+    known_ids = set(records)
+    current = {}
+    for key, entry in records.items():
+        normalized = _normalized_record(entry, known_ids)
+        if normalized["id"] != key or normalized["id"] in current:
+            raise ValueError("invalid dataset id")
+        if normalized["id"] in normalized["depends_on"]:
+            raise ValueError("dependencies must be unique, already registered dataset ids")
+        current[normalized["id"]] = normalized
+    if _toposort(current) is None:
+        raise ValueError("dependency cycle detected")
+    return current
+
+
+def _diff_records(current, snapshot):
+    before_ids = set(current)
+    after_ids = set(snapshot)
+    added = [copy.deepcopy(snapshot[key]) for key in sorted(after_ids - before_ids)]
+    removed = [copy.deepcopy(current[key]) for key in sorted(before_ids - after_ids)]
+    changed = []
+    for key in sorted(before_ids & after_ids):
+        before = current[key]
+        after = snapshot[key]
+        changed_keys = sorted(name for name in set(before) | set(after)
+                              if before.get(name) != after.get(name))
+        if changed_keys:
+            changed.append({"id": key, "before": copy.deepcopy(before),
+                            "after": copy.deepcopy(after), "changed_keys": changed_keys})
+    return {"added": added, "removed": removed, "changed": changed}
+
+
+def _downstream_index(records):
+    downstream = {}
+    for key, entry in records.items():
+        for source in entry["depends_on"]:
+            downstream.setdefault(source, set()).add(key)
+    return downstream
+
+
+def _shortest_downstream(downstream, source):
+    """Map each reached id to its shortest downstream path from source.
+
+    Distances are positive edge counts and the path includes source and target;
+    among equal-distance paths the lexicographically smallest id sequence wins.
+    """
+    reached = {}
+    frontier = {source: [source]}
+    distance = 0
+    while frontier:
+        distance += 1
+        candidates = {}
+        for node, path in frontier.items():
+            for child in downstream.get(node, ()):  # unconnected records are never reached
+                if child in reached:
+                    continue
+                candidate = path + [child]
+                if child not in candidates or candidate < candidates[child]:
+                    candidates[child] = candidate
+        for child, path in candidates.items():
+            reached[child] = {"distance": distance, "path": path}
+        frontier = candidates
+    return reached
+
+
 class DatasetCatalog:
     def __init__(self, path):
         self.path = Path(path)
@@ -259,50 +357,50 @@ class DatasetCatalog:
         return {"datasets": imported}
 
     def diff_bundle(self, bundle):
-        if not isinstance(bundle, dict):
-            raise ValueError("bundle must be an object")
-        descriptors = bundle.get("datasets")
-        if not isinstance(descriptors, list):
-            raise ValueError("bundle must contain a datasets array")
-
-        snapshot_ids = set()
-        for dataset in descriptors:
-            if not isinstance(dataset, dict):
-                raise ValueError("invalid dataset descriptor")
-            identifier = dataset.get("id")
-            if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
-                raise ValueError("invalid dataset id")
-            if identifier in snapshot_ids:
-                raise ValueError("dataset already registered")
-            snapshot_ids.add(identifier)
-
-        snapshot = {}
-        for dataset in descriptors:
-            entry = _normalized_record(dataset, snapshot_ids)
-            if entry["id"] in entry["depends_on"]:
-                raise ValueError("dependencies must be unique, already registered dataset ids")
-            snapshot[entry["id"]] = entry
-        if _toposort(snapshot) is None:
-            raise ValueError("dependency cycle detected")
-
+        snapshot = _normalized_snapshot(bundle)
         records = self.entries()
         current = {key: _normalized_record(entry, set(records))
                    for key, entry in records.items()}
+        return _diff_records(current, snapshot)
 
-        before_ids = set(current)
-        after_ids = set(snapshot)
-        added = [copy.deepcopy(snapshot[key]) for key in sorted(after_ids - before_ids)]
-        removed = [copy.deepcopy(current[key]) for key in sorted(before_ids - after_ids)]
-        changed = []
-        for key in sorted(before_ids & after_ids):
-            before = current[key]
-            after = snapshot[key]
-            changed_keys = sorted(name for name in set(before) | set(after)
-                                  if before.get(name) != after.get(name))
-            if changed_keys:
-                changed.append({"id": key, "before": copy.deepcopy(before),
-                                "after": copy.deepcopy(after), "changed_keys": changed_keys})
-        return {"added": added, "removed": removed, "changed": changed}
+    def preview_bundle(self, bundle):
+        snapshot = _normalized_snapshot(bundle)
+        current = _normalized_catalog(self.entries())
+        diff = _diff_records(current, snapshot)
+
+        source_ids = ([row["id"] for row in diff["added"]]
+                      + [row["id"] for row in diff["removed"]]
+                      + [row["id"] for row in diff["changed"]])
+
+        before_graph = _downstream_index(current)
+        after_graph = _downstream_index(snapshot)
+        before_reach = {}
+        after_reach = {}
+        for source in source_ids:
+            before_reach[source] = (
+                _shortest_downstream(before_graph, source) if source in current else None)
+            after_reach[source] = (
+                _shortest_downstream(after_graph, source) if source in snapshot else None)
+
+        affected_map = {}
+        for source in source_ids:
+            before_hits = before_reach[source] or {}
+            after_hits = after_reach[source] or {}
+            for target in set(before_hits) | set(after_hits):
+                if target == source:  # a source is not affected by its own change
+                    continue
+                causes = affected_map.setdefault(target, {})
+                before = before_hits.get(target)
+                after = after_hits.get(target)
+                if before is not None or after is not None:
+                    causes[source] = {"id": source, "before": before, "after": after}
+
+        affected = []
+        for target in sorted(affected_map):
+            causes = affected_map[target]
+            affected.append({"id": target,
+                             "causes": [causes[source] for source in sorted(causes)]})
+        return {"diff": diff, "affected": affected}
 
 
 def main():
@@ -312,6 +410,7 @@ def main():
     commands.add_parser("register").add_argument("file")
     commands.add_parser("import", help="import a bundle of dataset metadata").add_argument("file")
     commands.add_parser("diff", help="compare the catalog with a read-only snapshot bundle").add_argument("file")
+    commands.add_parser("preview", help="diff a snapshot and preview its downstream impact").add_argument("file")
     commands.add_parser("describe").add_argument("id")
     commands.add_parser("dependencies").add_argument("id")
     impact = commands.add_parser("impact")
@@ -332,6 +431,8 @@ def main():
             result = catalog.import_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "diff":
             result = catalog.diff_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
+        elif args.command == "preview":
+            result = catalog.preview_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "export":
             result = catalog.export(None if args.ids is None else args.ids)
         elif args.command == "impact":
