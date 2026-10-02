@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 import subprocess
@@ -37,6 +38,158 @@ class CatalogTests(unittest.TestCase):
             self.catalog.register(self.raw)
         with self.assertRaises(ValueError):
             self.catalog.dependencies("missing")
+
+    def test_malformed_descriptions_all_raise_value_error(self):
+        valid_field = {"name": "amount", "type": "number"}
+        invalid = [
+            None, True, False, 1, 1.5, "orders", ["orders"], (),
+            {},
+            {"fields": [valid_field]},
+            {"id": "orders"},
+            {"id": None, "fields": [valid_field]},
+            {"id": 3, "fields": [valid_field]},
+            {"id": ["orders"], "fields": [valid_field]},
+            {"id": {"x": 1}, "fields": [valid_field]},
+            {"id": "Orders", "fields": [valid_field]},
+            {"id": "1orders", "fields": [valid_field]},
+            {"id": "ord ers", "fields": [valid_field]},
+            {"id": "orders", "fields": None},
+            {"id": "orders", "fields": []},
+            {"id": "orders", "fields": valid_field},
+            {"id": "orders", "fields": "amount"},
+            {"id": "orders", "fields": [["amount", "number"]]},
+            {"id": "orders", "fields": ["amount"]},
+            {"id": "orders", "fields": [1]},
+            {"id": "orders", "fields": [None]},
+            {"id": "orders", "fields": [{"type": "number"}]},
+            {"id": "orders", "fields": [{"name": "amount"}]},
+            {"id": "orders", "fields": [{"name": None, "type": "number"}]},
+            {"id": "orders", "fields": [{"name": 1, "type": "number"}]},
+            {"id": "orders", "fields": [{"name": ["amount"], "type": "number"}]},
+            {"id": "orders", "fields": [{"name": {"x": 1}, "type": "number"}]},
+            {"id": "orders", "fields": [{"name": "", "type": "number"}]},
+            {"id": "orders", "fields": [{"name": "   ", "type": "number"}]},
+            {"id": "orders", "fields": [{"name": "amount", "type": None}]},
+            {"id": "orders", "fields": [{"name": "amount", "type": 1}]},
+            {"id": "orders", "fields": [{"name": "amount", "type": "float"}]},
+            {"id": "orders", "fields": [{"name": "amount", "type": ["number"]}]},
+            {"id": "orders", "fields": [{"name": "amount", "type": {"t": "number"}}]},
+            {"id": "orders", "fields": [dict(valid_field), dict(valid_field)]},
+            {"id": "orders", "fields": [valid_field], "depends_on": "orders"},
+            {"id": "orders", "fields": [valid_field], "depends_on": {"orders": 1}},
+            {"id": "orders", "fields": [valid_field], "depends_on": [1]},
+            {"id": "orders", "fields": [valid_field], "depends_on": [None]},
+            {"id": "orders", "fields": [valid_field], "depends_on": [["orders"]]},
+            # several problems at once must still surface the single exception type
+            {"id": "BAD ID", "fields": [{"type": None}], "depends_on": [1, 1]},
+        ]
+        for bad in invalid:
+            snapshot = copy.deepcopy(bad)
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self.catalog.register(bad)
+            self.assertEqual(bad, snapshot)
+        self.assertFalse(self.path.exists())
+
+    def test_failed_registration_creates_no_catalog_or_parent_directories(self):
+        nested = Path(self.temp.name) / "nested" / "deeper" / "catalog.json"
+        catalog = DatasetCatalog(nested)
+        for bad in ("not-a-dict", ["not-a-dict"], 42,
+                    {"id": "orders"}, {"id": "orders", "fields": []},
+                    {"id": "orders", "fields": [{"name": "n", "type": "weird"}]}):
+            with self.assertRaises(ValueError):
+                catalog.register(copy.deepcopy(bad))
+        self.assertFalse(nested.exists())
+        self.assertFalse(nested.parent.exists())
+
+    def test_failed_registration_keeps_existing_catalog_bytes_unchanged(self):
+        self.catalog.register({"id": "orders", "fields": [{"name": "amount", "type": "number"}]})
+        before = self.path.read_bytes()
+        mtime = self.path.stat().st_mtime_ns
+        for bad in (
+            {"id": "orders", "fields": [{"name": "amount", "type": "number"}]},
+            {"id": "daily", "fields": [{"name": "total", "type": "number"}], "depends_on": ["missing"]},
+            {"id": "daily", "fields": [{"name": "total", "type": "number"}],
+             "depends_on": ["orders", "orders"]},
+            {"id": "daily", "fields": [{"name": "total", "type": "weird"}]},
+            {"id": "daily", "fields": [{"name": " ", "type": "number"}]},
+        ):
+            with self.assertRaises(ValueError):
+                self.catalog.register(copy.deepcopy(bad))
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.path.stat().st_mtime_ns, mtime)
+
+    def test_valid_registration_preserves_whitespace_order_and_defaults(self):
+        descriptor = {
+            "id": "orders", "description": 123, "meta": {"owner": "analytics"},
+            "fields": [{"name": " order id ", "type": "string", "extra": "x"},
+                       {"name": "amount", "type": "number"}],
+            "depends_on": [],
+        }
+        snapshot = copy.deepcopy(descriptor)
+        entry = self.catalog.register(descriptor)
+        self.assertEqual(entry["fields"], [{"name": " order id ", "type": "string"},
+                                           {"name": "amount", "type": "number"}])
+        self.assertEqual(entry["description"], "123")
+        self.assertEqual(entry["depends_on"], [])
+        self.assertEqual(descriptor, snapshot)
+        fresh = DatasetCatalog(self.path)
+        self.assertEqual(fresh.describe("orders"), entry)
+        minimal = self.catalog.register({"id": "bare",
+                                         "fields": [{"name": "n", "type": "integer"}]})
+        self.assertEqual(minimal["description"], "")
+        self.assertEqual(minimal["depends_on"], [])
+
+    def test_dependencies_sorted_and_identical_after_reopen(self):
+        for descriptor in (
+            {"id": "orders", "fields": [{"name": "n", "type": "integer"}]},
+            {"id": "daily", "fields": [{"name": "n", "type": "integer"}], "depends_on": ["orders"]},
+            {"id": "report", "fields": [{"name": "n", "type": "integer"}],
+             "depends_on": ["daily", "orders"]},
+        ):
+            self.catalog.register(descriptor)
+        record = self.catalog.describe("report")
+        fresh = DatasetCatalog(self.path)
+        self.assertEqual(fresh.describe("report"), record)
+        self.assertEqual([row["id"] for row in fresh.dependencies("report")],
+                         ["daily", "orders"])
+
+    def test_queries_identical_before_and_after_failed_registration(self):
+        for name in ("orders.json", "daily.json"):
+            descriptor = json.loads((ROOT / "samples" / name).read_text(encoding="utf-8"))
+            self.catalog.register(descriptor)
+
+        def snapshot():
+            return {
+                "describe": self.catalog.describe("orders"),
+                "dependencies": self.catalog.dependencies("daily_totals"),
+                "impact": self.catalog.impact("orders"),
+                "export_all": self.catalog.export(),
+                "export_one": self.catalog.export(["daily_totals"]),
+            }
+
+        before = snapshot()
+        for bad in ({"id": "broken", "fields": [{"name": "x", "type": "weird"}],
+                     "depends_on": ["nope"]},
+                    {"id": "orders", "fields": [{"name": "x", "type": "number"}]}):
+            with self.assertRaises(ValueError):
+                self.catalog.register(copy.deepcopy(bad))
+        self.assertEqual(snapshot(), before)
+
+    def test_cli_invalid_registration_prints_json_error_and_exits_2(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        descriptor = Path(self.temp.name) / "bad.json"
+        for content in (json.dumps({"id": "bad", "fields": [{"name": "x", "type": "weird"}]}),
+                        json.dumps(["not", "a", "dict"]),
+                        "{not valid json"):
+            descriptor.write_text(content, encoding="utf-8")
+            run = subprocess.run(prefix + ["register", str(descriptor)],
+                                 capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2)
+            payload = json.loads(run.stdout)
+            self.assertEqual(set(payload), {"error"})
+            self.assertTrue(payload["error"])
+            self.assertFalse(self.path.exists())
 
     def _register(self, identifier, depends_on=None):
         self.catalog.register({"id": identifier,
