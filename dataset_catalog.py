@@ -227,6 +227,56 @@ class DatasetCatalog:
         result.sort(key=lambda item: (item["distance"], item["dataset"]["id"]))
         return result
 
+    def upstream(self, identifier, max_depth=None):
+        if max_depth is not None and (isinstance(max_depth, bool)
+                                      or not isinstance(max_depth, int) or max_depth <= 0):
+            raise ValueError("max_depth must be None or a positive integer")
+        if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
+            raise ValueError("invalid dataset id")
+        records = self.entries()
+        if not isinstance(records, dict):
+            raise ValueError("invalid catalog state")
+        if identifier not in records:
+            raise ValueError("unknown dataset")
+        known_ids = set(records)
+        closure = {}
+        stack = [identifier]
+        while stack:
+            key = stack.pop()
+            if key in closure:
+                continue
+            entry = _normalized_record(records[key], known_ids)
+            if entry["id"] != key:
+                raise ValueError("invalid dataset descriptor")
+            if entry["id"] in entry["depends_on"]:
+                raise ValueError("dependencies must be unique, already registered dataset ids")
+            closure[key] = entry
+            stack.extend(entry["depends_on"])
+        if _toposort(closure) is None:
+            raise ValueError("dependency cycle detected")
+        reached = {identifier: [identifier]}
+        frontier = {identifier: [identifier]}
+        result = []
+        distance = 0
+        while frontier and (max_depth is None or distance < max_depth):
+            distance += 1
+            candidates = {}
+            for node, path in frontier.items():
+                for parent in closure[node]["depends_on"]:
+                    if parent in reached:
+                        continue
+                    candidate = path + [parent]
+                    if parent not in candidates or candidate < candidates[parent]:
+                        candidates[parent] = candidate
+            if not candidates:
+                break
+            frontier = candidates
+            reached.update(candidates)
+            for parent, path in candidates.items():
+                result.append({"dataset": records[parent], "distance": distance, "path": path})
+        result.sort(key=lambda item: (item["distance"], item["dataset"]["id"]))
+        return result
+
     def export(self, identifiers=None):
         if identifiers is not None and not isinstance(identifiers, list):
             raise ValueError("identifiers must be None or a list of dataset ids")
@@ -482,6 +532,14 @@ class DatasetCatalog:
         return diff
 
 
+def _parse_max_depth(raw):
+    if raw is None:
+        return None
+    if not re.fullmatch(r"[0-9]+", raw) or int(raw) <= 0:
+        raise ValueError("invalid max_depth")
+    return int(raw)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--catalog", default="samples/catalog.json")
@@ -507,6 +565,9 @@ def main():
     impact = commands.add_parser("impact")
     impact.add_argument("id")
     impact.add_argument("--max-depth")
+    upstream = commands.add_parser("upstream")
+    upstream.add_argument("id")
+    upstream.add_argument("--max-depth")
     export = commands.add_parser("export")
     export.add_argument("--id", action="append", dest="ids")
     search = commands.add_parser("search")
@@ -539,14 +600,9 @@ def main():
         elif args.command == "export":
             result = catalog.export(None if args.ids is None else args.ids)
         elif args.command == "impact":
-            raw_depth = args.max_depth
-            if raw_depth is not None:
-                if not re.fullmatch(r"[0-9]+", raw_depth) or int(raw_depth) <= 0:
-                    raise ValueError("invalid max_depth")
-                max_depth = int(raw_depth)
-            else:
-                max_depth = None
-            result = catalog.impact(args.id, max_depth=max_depth)
+            result = catalog.impact(args.id, max_depth=_parse_max_depth(args.max_depth))
+        elif args.command == "upstream":
+            result = catalog.upstream(args.id, max_depth=_parse_max_depth(args.max_depth))
         elif args.command == "search":
             result = catalog.search(args.query, args.field_type, args.tags, args.owner)
         else:
