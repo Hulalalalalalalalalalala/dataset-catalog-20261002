@@ -277,6 +277,89 @@ class DatasetCatalog:
         result.sort(key=lambda item: (item["distance"], item["dataset"]["id"]))
         return result
 
+    def common_upstream(self, identifiers):
+        if not isinstance(identifiers, list):
+            raise ValueError("identifiers must be a list of dataset ids")
+        for item in identifiers:
+            if not isinstance(item, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", item):
+                raise ValueError("invalid dataset id")
+        targets = sorted(set(identifiers))
+        if len(targets) < 2:
+            raise ValueError("at least two distinct dataset ids are required")
+        records = self.entries()
+        if not isinstance(records, dict):
+            raise ValueError("invalid catalog state")
+        if any(item not in records for item in targets):
+            raise ValueError("unknown dataset")
+        known_ids = set(records)
+        closure = {}
+        stack = list(targets)
+        while stack:
+            key = stack.pop()
+            if key in closure:
+                continue
+            entry = _normalized_record(records[key], known_ids)
+            if entry["id"] != key:
+                raise ValueError("invalid dataset descriptor")
+            if entry["id"] in entry["depends_on"]:
+                raise ValueError("dependencies must be unique, already registered dataset ids")
+            closure[key] = entry
+            stack.extend(entry["depends_on"])
+        if _toposort(closure) is None:
+            raise ValueError("dependency cycle detected")
+
+        def reachable(start):
+            reached = {start: [start]}
+            frontier = {start: [start]}
+            while frontier:
+                candidates = {}
+                for node, path in frontier.items():
+                    for parent in closure[node]["depends_on"]:
+                        if parent in reached:
+                            continue
+                        candidate = path + [parent]
+                        if parent not in candidates or candidate < candidates[parent]:
+                            candidates[parent] = candidate
+                if not candidates:
+                    break
+                frontier = candidates
+                reached.update(candidates)
+            return reached
+
+        paths_by_target = {target: reachable(target) for target in targets}
+        common = set(paths_by_target[targets[0]])
+        for target in targets[1:]:
+            common &= set(paths_by_target[target])
+
+        downstream = {}
+        for key, entry in closure.items():
+            for source in entry["depends_on"]:
+                downstream.setdefault(source, set()).add(key)
+
+        def downstream_nodes(source):
+            seen = set()
+            pending = [source]
+            while pending:
+                node = pending.pop()
+                for child in downstream.get(node, ()):
+                    if child in closure and child not in seen:
+                        seen.add(child)
+                        pending.append(child)
+            return seen
+
+        result = []
+        for source in sorted(common):
+            if (downstream_nodes(source) & common) - {source}:
+                continue
+            result.append({
+                "dataset": records[source],
+                "targets": [{"id": target,
+                             "distance": len(paths_by_target[target][source]) - 1,
+                             "path": paths_by_target[target][source]}
+                            for target in targets],
+            })
+        return result
+
     def export(self, identifiers=None):
         if identifiers is not None and not isinstance(identifiers, list):
             raise ValueError("identifiers must be None or a list of dataset ids")
@@ -570,6 +653,9 @@ def main():
     upstream.add_argument("--max-depth")
     export = commands.add_parser("export")
     export.add_argument("--id", action="append", dest="ids")
+    common_upstream = commands.add_parser("common-upstream",
+                                         help="find common upstream sources shared by several datasets")
+    common_upstream.add_argument("--id", action="append", dest="ids")
     search = commands.add_parser("search")
     search.add_argument("query", nargs="?", default="")
     search.add_argument("--field-type", dest="field_type")
@@ -599,6 +685,8 @@ def main():
                 result = catalog.apply_bundle(bundle, expected)
         elif args.command == "export":
             result = catalog.export(None if args.ids is None else args.ids)
+        elif args.command == "common-upstream":
+            result = catalog.common_upstream(args.ids)
         elif args.command == "impact":
             result = catalog.impact(args.id, max_depth=_parse_max_depth(args.max_depth))
         elif args.command == "upstream":

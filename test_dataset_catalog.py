@@ -458,6 +458,174 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("error", json.loads(bad.stdout))
 
 
+    def test_common_upstream_finds_shared_sources_with_distances_and_paths(self):
+        for identifier, depends_on in (("orders", []), ("daily_totals", ["orders"]),
+                                       ("weekly", ["daily_totals"])):
+            self._register(identifier, depends_on)
+        result = self.catalog.common_upstream(["orders", "daily_totals"])
+        self.assertEqual(len(result), 1)
+        self.assertEqual(set(result[0]), {"dataset", "targets"})
+        self.assertEqual(result[0]["dataset"]["id"], "orders")
+        self.assertEqual(result[0]["dataset"], self.catalog.describe("orders"))
+        self.assertEqual(result[0]["targets"],
+                         [{"id": "daily_totals", "distance": 1,
+                           "path": ["daily_totals", "orders"]},
+                          {"id": "orders", "distance": 0, "path": ["orders"]}])
+        for target in result[0]["targets"]:
+            self.assertEqual(set(target), {"id", "distance", "path"})
+        result = self.catalog.common_upstream(["weekly", "orders"])
+        self.assertEqual([row["dataset"]["id"] for row in result], ["orders"])
+        self.assertEqual([(t["id"], t["distance"]) for t in result[0]["targets"]],
+                         [("orders", 0), ("weekly", 2)])
+
+    def test_common_upstream_keeps_independent_sources_and_drops_intermediates(self):
+        for identifier, depends_on in (
+                ("s1", []), ("s2", []),
+                ("p", ["s1", "s2"]), ("q", ["s2", "s1"])):
+            self._register(identifier, depends_on)
+        result = self.catalog.common_upstream(["p", "q"])
+        self.assertEqual([row["dataset"]["id"] for row in result], ["s1", "s2"])
+        for row in result:
+            self.assertEqual([t["distance"] for t in row["targets"]], [1, 1])
+
+        for identifier, depends_on in (
+                ("base", []), ("left", ["base"]), ("right", ["base"]),
+                ("merge", ["left", "right"]), ("u", ["merge"]), ("v", ["merge"])):
+            self.catalog.register({"id": identifier,
+                                   "fields": [{"name": "n", "type": "integer"}],
+                                   "depends_on": depends_on})
+        result = self.catalog.common_upstream(["u", "v"])
+        self.assertEqual([row["dataset"]["id"] for row in result], ["merge"])
+        self.assertEqual([[t["id"] for t in row["targets"]] for row in result],
+                         [["u", "v"]])
+
+    def test_common_upstream_no_shared_source_and_input_order_independence(self):
+        for identifier, depends_on in (
+                ("a", []), ("x", ["a"]), ("b", []), ("y", ["b"])):
+            self._register(identifier, depends_on)
+        self.assertEqual(self.catalog.common_upstream(["x", "y"]), [])
+        for identifier, depends_on in (
+                ("s1", []), ("s2", []),
+                ("p", ["s1", "s2"]), ("q", ["s2", "s1"])):
+            self.catalog.register({"id": identifier,
+                                   "fields": [{"name": "n", "type": "integer"}],
+                                   "depends_on": depends_on})
+        first = self.catalog.common_upstream(["q", "p"])
+        second = self.catalog.common_upstream(["p", "q", "p", "q"])
+        self.assertEqual(first, second)
+        self.assertEqual([row["dataset"]["id"] for row in first], ["s1", "s2"])
+
+    def test_common_upstream_picks_lexicographically_smallest_equal_path(self):
+        for identifier, depends_on in (
+                ("z", []), ("a", ["z"]), ("b", ["z"]),
+                ("k", ["b", "a"]), ("m", ["a"])):
+            self._register(identifier, depends_on)
+        result = self.catalog.common_upstream(["k", "m"])
+        sources = {row["dataset"]["id"]: row for row in result}
+        self.assertEqual(set(sources), {"a"})
+        k_to_a = [t for t in sources["a"]["targets"] if t["id"] == "k"][0]
+        self.assertEqual(k_to_a["path"], ["k", "a"])
+        m_to_a = [t for t in sources["a"]["targets"] if t["id"] == "m"][0]
+        self.assertEqual(m_to_a["path"], ["m", "a"])
+
+    def test_common_upstream_validates_arguments_before_reading_catalog(self):
+        self._register("orders")
+        self._register("daily")
+        for bad in (None, "orders", ("orders", "daily"), {1}, True, 1,
+                    ["orders"], ["orders", "orders"], [],
+                    ["", "orders"], ["Orders", "daily"], ["ord ers", "daily"],
+                    [1, "daily"], [None, "daily"], ["orders", b"daily"]):
+            with self.assertRaises(ValueError):
+                self.catalog.common_upstream(bad)
+        missing = DatasetCatalog(Path(self.temp.name) / "absent" / "catalog.json")
+        for bad in (["orders"], ["Orders", "daily"], [1, "daily"]):
+            with self.assertRaises(ValueError):
+                missing.common_upstream(bad)
+        self.assertFalse(missing.path.exists())
+        with self.assertRaises(ValueError):
+            missing.common_upstream(["orders", "daily"])
+        self.assertFalse(missing.path.exists())
+
+    def test_common_upstream_validates_targets_and_full_closure(self):
+        self._register("orders")
+        with self.assertRaises(ValueError):
+            self.catalog.common_upstream(["orders", "ghost"])
+        self._write_records({
+            "base": {"id": "base", "fields": [{"name": "n", "type": "integer"}]},
+            "top1": {"id": "top1", "fields": [{"name": "n", "type": "integer"}],
+                     "depends_on": ["base"]},
+            "top2": {"id": "top2", "fields": [{"name": "n", "type": "integer"}],
+                     "depends_on": ["base"]},
+            "corrupt": "not a descriptor",
+            "cyclic": {"id": "cyclic", "fields": [{"name": "n", "type": "integer"}],
+                       "depends_on": ["cyclic"]},
+        })
+        result = self.catalog.common_upstream(["top1", "top2"])
+        self.assertEqual([row["dataset"]["id"] for row in result], ["base"])
+        bad_states = (
+            ["not", "an", "object"],
+            {"base": {"id": "other", "fields": [{"name": "n", "type": "integer"}]},
+             "top1": {"id": "top1", "fields": [{"name": "n", "type": "integer"}],
+                      "depends_on": ["base"]},
+             "top2": {"id": "top2", "fields": [{"name": "n", "type": "integer"}],
+                      "depends_on": ["base"]}},
+            {"base": {"id": "base", "fields": [{"name": "n", "type": "integer"}],
+                      "depends_on": ["ghost"]},
+             "top1": {"id": "top1", "fields": [{"name": "n", "type": "integer"}],
+                      "depends_on": ["base"]},
+             "top2": {"id": "top2", "fields": [{"name": "n", "type": "integer"}],
+                      "depends_on": ["base"]}},
+            {"base": {"id": "base", "fields": [{"name": "n", "type": "integer"}],
+                      "depends_on": ["base"]},
+             "top1": {"id": "top1", "fields": [{"name": "n", "type": "integer"}],
+                      "depends_on": ["base"]},
+             "top2": {"id": "top2", "fields": [{"name": "n", "type": "integer"}],
+                      "depends_on": ["base"]}},
+            {"base": {"id": "base", "fields": [{"name": "n", "type": "integer"}],
+                      "depends_on": ["top1"]},
+             "top1": {"id": "top1", "fields": [{"name": "n", "type": "integer"}],
+                      "depends_on": ["base"]},
+             "top2": {"id": "top2", "fields": [{"name": "n", "type": "integer"}],
+                      "depends_on": ["base"]}},
+        )
+        for state in bad_states:
+            self._write_records(state)
+            with self.assertRaises(ValueError):
+                self.catalog.common_upstream(["top1", "top2"])
+
+    def test_common_upstream_is_read_only(self):
+        for identifier, depends_on in (("orders", []), ("daily_totals", ["orders"])):
+            self._register(identifier, depends_on)
+        before = self.path.read_text(encoding="utf-8")
+        self.catalog.common_upstream(["orders", "daily_totals"])
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_cli_common_upstream(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")], check=True, capture_output=True)
+        subprocess.run(prefix + ["register", str(ROOT / "samples/daily.json")], check=True, capture_output=True)
+        ok = subprocess.run(prefix + ["common-upstream", "--id", "orders", "--id", "daily_totals"],
+                            capture_output=True, text=True)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        result = json.loads(ok.stdout)
+        self.assertEqual([row["dataset"]["id"] for row in result], ["orders"])
+        self.assertEqual(result[0]["targets"],
+                         [{"id": "daily_totals", "distance": 1,
+                           "path": ["daily_totals", "orders"]},
+                          {"id": "orders", "distance": 0, "path": ["orders"]}])
+        default = [sys.executable, str(ROOT / "dataset_catalog.py")]
+        run = subprocess.run(default + ["common-upstream", "--id", "orders", "--id", "daily_totals"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout), result)
+        for bad_args in (["common-upstream", "--id", "orders"],
+                         ["common-upstream"],
+                         ["common-upstream", "--id", "orders", "--id", "Orders"],
+                         ["common-upstream", "--id", "orders", "--id", "missing"]):
+            run = subprocess.run(prefix + bad_args, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 2, bad_args)
+            self.assertEqual(set(json.loads(run.stdout)), {"error"}, bad_args)
+
     def test_register_normalizes_and_persists_tags(self):
         entry = self.catalog.register({**self.raw, "tags": [" Finance ", "日汇总", "finance", "FINANCE"]})
         self.assertEqual(entry["tags"], ["Finance", "日汇总"])

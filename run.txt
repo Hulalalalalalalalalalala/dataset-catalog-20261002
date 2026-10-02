@@ -16,6 +16,10 @@ Returns orders at distance 1 with path ["daily_totals","orders"]; direct and ind
 sorted by distance then id, with --max-depth limiting the shortest distance; read-only, errors exit 2.
 python3 dataset_catalog.py export --id daily_totals
 Returns {"datasets":[orders record, daily_totals record]}, dependencies first.
+python3 dataset_catalog.py common-upstream --id orders --id daily_totals
+Returns only orders as a common source with targets daily_totals (distance 1) and orders (distance 0);
+repeat --id to name more targets (duplicates merge, at least two distinct registered ids required),
+multiple independent common sources are all kept, results are sorted by source id; read-only, errors exit 2.
 python3 dataset_catalog.py search "daily amount"
 Returns only orders with matched_fields ["amount"]; search is read-only.
 python3 dataset_catalog.py search --field-type integer
