@@ -78,6 +78,35 @@ def _toposort(entries):
     return ordered if len(ordered) == len(entries) else None
 
 
+def _downstream_index(records):
+    downstream = {}
+    for key, entry in records.items():
+        for source in entry["depends_on"]:
+            downstream.setdefault(source, set()).add(key)
+    return downstream
+
+
+def _shortest_downstream_paths(downstream, source):
+    reached = {source: [source]}
+    frontier = {source: [source]}
+    paths = {}
+    while frontier:
+        candidates = {}
+        for node, path in frontier.items():
+            for child in downstream.get(node, ()):
+                if child in reached:
+                    continue
+                candidate = path + [child]
+                if child not in candidates or candidate < candidates[child]:
+                    candidates[child] = candidate
+        if not candidates:
+            break
+        frontier = candidates
+        reached.update(candidates)
+        paths.update(candidates)
+    return paths
+
+
 class DatasetCatalog:
     def __init__(self, path):
         self.path = Path(path)
@@ -258,7 +287,7 @@ class DatasetCatalog:
                                  encoding="utf-8")
         return {"datasets": imported}
 
-    def diff_bundle(self, bundle):
+    def _snapshot_state(self, bundle):
         if not isinstance(bundle, dict):
             raise ValueError("bundle must be an object")
         descriptors = bundle.get("datasets")
@@ -284,11 +313,10 @@ class DatasetCatalog:
             snapshot[entry["id"]] = entry
         if _toposort(snapshot) is None:
             raise ValueError("dependency cycle detected")
+        return snapshot
 
-        records = self.entries()
-        current = {key: _normalized_record(entry, set(records))
-                   for key, entry in records.items()}
-
+    @staticmethod
+    def _diff_states(current, snapshot):
         before_ids = set(current)
         after_ids = set(snapshot)
         added = [copy.deepcopy(snapshot[key]) for key in sorted(after_ids - before_ids)]
@@ -304,6 +332,59 @@ class DatasetCatalog:
                                 "after": copy.deepcopy(after), "changed_keys": changed_keys})
         return {"added": added, "removed": removed, "changed": changed}
 
+    def diff_bundle(self, bundle):
+        snapshot = self._snapshot_state(bundle)
+        records = self.entries()
+        current = {key: _normalized_record(entry, set(records))
+                   for key, entry in records.items()}
+        return self._diff_states(current, snapshot)
+
+    def preview_bundle(self, bundle):
+        snapshot = self._snapshot_state(bundle)
+        records = self.entries()
+        if not isinstance(records, dict):
+            raise ValueError("invalid catalog state")
+        current = {}
+        for key, entry in records.items():
+            normalized = _normalized_record(entry, set(records))
+            if normalized["id"] != key:
+                raise ValueError("invalid dataset descriptor")
+            if normalized["id"] in normalized["depends_on"]:
+                raise ValueError("dependencies must be unique, already registered dataset ids")
+            current[key] = normalized
+        if _toposort(current) is None:
+            raise ValueError("dependency cycle detected")
+
+        diff = self._diff_states(current, snapshot)
+        sources = {row["id"] for row in diff["added"]}
+        sources.update(row["id"] for row in diff["removed"])
+        sources.update(row["id"] for row in diff["changed"])
+
+        # target id -> source id -> {"before"/"after": propagation explanation}
+        reached_by = {}
+        for side, state in (("before", current), ("after", snapshot)):
+            downstream = _downstream_index(state)
+            for source in sources:
+                if source not in state:
+                    continue
+                for target, path in _shortest_downstream_paths(downstream, source).items():
+                    propagation = {"distance": len(path) - 1, "path": path}
+                    reached_by.setdefault(target, {}).setdefault(source, {})[side] = propagation
+
+        affected = []
+        for target in sorted(reached_by):
+            causes = []
+            for source in sorted(reached_by[target]):
+                sides = reached_by[target][source]
+                before = sides.get("before")
+                after = sides.get("after")
+                if before is None and after is None:
+                    continue
+                causes.append({"id": source, "before": before, "after": after})
+            if causes:
+                affected.append({"id": target, "causes": causes})
+        return {"diff": diff, "affected": affected}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -312,6 +393,9 @@ def main():
     commands.add_parser("register").add_argument("file")
     commands.add_parser("import", help="import a bundle of dataset metadata").add_argument("file")
     commands.add_parser("diff", help="compare the catalog with a read-only snapshot bundle").add_argument("file")
+    commands.add_parser("preview",
+                        help="diff a snapshot bundle and preview the downstream impact of the change"
+                        ).add_argument("file")
     commands.add_parser("describe").add_argument("id")
     commands.add_parser("dependencies").add_argument("id")
     impact = commands.add_parser("impact")
@@ -332,6 +416,8 @@ def main():
             result = catalog.import_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "diff":
             result = catalog.diff_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
+        elif args.command == "preview":
+            result = catalog.preview_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "export":
             result = catalog.export(None if args.ids is None else args.ids)
         elif args.command == "impact":

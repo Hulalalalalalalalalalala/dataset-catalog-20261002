@@ -20,4 +20,8 @@ Lists datasets having an integer field; an omitted query means no keyword restri
 python3 dataset_catalog.py diff FILE
 Compares the catalog (before) with a {"datasets":[...]} snapshot file (after, treated as complete)
 and prints {"added":[...],"removed":[...],"changed":[...]} sorted by id; read-only, errors exit 2.
+python3 dataset_catalog.py preview FILE
+Prints {"diff":{...},"affected":[...]}: the diff result plus every downstream dataset reached from
+an added, removed or changed source, with lexicographically-smallest shortest before/after paths;
+read-only, errors exit 2.
 python3 -B -m unittest -v

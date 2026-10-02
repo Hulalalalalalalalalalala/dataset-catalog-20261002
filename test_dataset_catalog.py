@@ -855,6 +855,222 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("error", json.loads(run.stdout))
         self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
 
+    def test_preview_diff_matches_diff_bundle_and_structure(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"])]})
+        bundle = {"datasets": [
+            self._snapshot_record("a", description="updated"),
+            self._snapshot_record("b", ["a"]), self._snapshot_record("c", ["b"])]}
+        result = self.catalog.preview_bundle(bundle)
+        self.assertEqual(set(result), {"diff", "affected"})
+        self.assertEqual(result["diff"], self.catalog.diff_bundle(bundle))
+        self.assertEqual([item["id"] for item in result["affected"]], ["b", "c"])
+        b, c = result["affected"]
+        self.assertEqual(set(b), {"id", "causes"})
+        self.assertEqual(set(c), {"id", "causes"})
+        self.assertEqual(b["causes"], [
+            {"id": "a", "before": {"distance": 1, "path": ["a", "b"]},
+             "after": {"distance": 1, "path": ["a", "b"]}}])
+        self.assertEqual(c["causes"], [
+            {"id": "a", "before": None,
+             "after": {"distance": 2, "path": ["a", "b", "c"]}}])
+        for item in result["affected"]:
+            for cause in item["causes"]:
+                self.assertEqual(set(cause), {"id", "before", "after"})
+                for side in ("before", "after"):
+                    if cause[side] is not None:
+                        self.assertEqual(set(cause[side]), {"distance", "path"})
+
+    def test_preview_tag_change_propagates_and_source_is_self_excluded(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("c", ["b"])]})
+        result = self.catalog.preview_bundle({"datasets": [
+            self._snapshot_record("a", tags=["x"]), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("c", ["b"])]})
+        self.assertEqual([row["changed_keys"] for row in result["diff"]["changed"]], [["tags"]])
+        self.assertEqual([item["id"] for item in result["affected"]], ["b", "c"])
+        self.assertNotIn("a", [item["id"] for item in result["affected"]])
+
+    def test_preview_empty_affected_when_no_diff(self):
+        bundle = {"datasets": [self._snapshot_record("a"), self._snapshot_record("b", ["a"])]}
+        self.catalog.import_bundle(bundle)
+        self.assertEqual(self.catalog.preview_bundle(bundle)["affected"], [])
+
+    def test_preview_removed_source_propagates_only_before(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("c", ["b"])]})
+        result = self.catalog.preview_bundle({"datasets": []})
+        affected = {item["id"]: {cause["id"]: cause for cause in item["causes"]}
+                    for item in result["affected"]}
+        self.assertEqual(sorted(affected), ["b", "c"])
+        self.assertEqual(affected["b"]["a"]["before"], {"distance": 1, "path": ["a", "b"]})
+        self.assertIsNone(affected["b"]["a"]["after"])
+        self.assertEqual(affected["c"]["a"]["before"], {"distance": 2, "path": ["a", "b", "c"]})
+        self.assertIsNone(affected["c"]["a"]["after"])
+        self.assertEqual(affected["c"]["b"]["before"], {"distance": 1, "path": ["b", "c"]})
+        self.assertEqual([cause["id"] for cause in result["affected"][1]["causes"]], ["a", "b"])
+
+    def test_preview_added_source_propagates_only_after(self):
+        result = self.catalog.preview_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"])]})
+        affected = {item["id"]: {cause["id"]: cause for cause in item["causes"]}
+                    for item in result["affected"]}
+        self.assertEqual(sorted(affected), ["b"])
+        self.assertIsNone(affected["b"]["a"]["before"])
+        self.assertEqual(affected["b"]["a"]["after"], {"distance": 1, "path": ["a", "b"]})
+        self.assertFalse(self.path.exists())
+
+    def test_preview_source_can_be_affected_by_other_sources(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"])]})
+        # both a (changed) and b (changed to depend on a in the same way still reachable)
+        result = self.catalog.preview_bundle({"datasets": [
+            self._snapshot_record("a", description="changed"),
+            self._snapshot_record("b", ["a"], description="changed too")]})
+        b = [item for item in result["affected"] if item["id"] == "b"]
+        self.assertEqual(len(b), 1)
+        self.assertEqual([cause["id"] for cause in b[0]["causes"]], ["a"])
+
+    def test_preview_queries_each_side_independently(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("c", ["b"])]})
+        result = self.catalog.preview_bundle({"datasets": [
+            self._snapshot_record("a", description="changed"),
+            self._snapshot_record("b", ["a"]),
+            self._snapshot_record("c", ["a", "b"])]})
+        cause = [item for item in result["affected"] if item["id"] == "c"][0]["causes"][0]
+        self.assertEqual(cause["before"], {"distance": 2, "path": ["a", "b", "c"]})
+        self.assertEqual(cause["after"], {"distance": 1, "path": ["a", "c"]})
+
+    def test_preview_tie_breaks_equal_shortest_paths_by_id_sequence(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("c", ["a"]), self._snapshot_record("d", ["b", "c"])]})
+        result = self.catalog.preview_bundle({"datasets": [
+            self._snapshot_record("a", description="changed"),
+            self._snapshot_record("b", ["a"]), self._snapshot_record("c", ["a"]),
+            self._snapshot_record("d", ["b", "c"])]})
+        self.assertEqual([item["id"] for item in result["affected"]], ["b", "c", "d"])
+        cause = [item for item in result["affected"] if item["id"] == "d"][0]["causes"][0]
+        self.assertEqual(cause["before"]["path"], ["a", "b", "d"])
+        self.assertEqual(cause["after"]["path"], ["a", "b", "d"])
+
+    def test_preview_deleting_a_leaf_source_affects_nothing(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"])]})
+        result = self.catalog.preview_bundle({"datasets": [self._snapshot_record("a")]})
+        self.assertEqual([row["id"] for row in result["diff"]["removed"]], ["b"])
+        self.assertEqual(result["affected"], [])
+
+    def test_preview_validates_current_catalog_graph(self):
+        self._snapshot_record("a")
+        good = json.dumps({"datasets": [self._snapshot_record("a")]})
+        bad_states = [
+            json.dumps([self._snapshot_record("a")]),
+            json.dumps({"a": "x"}),
+            json.dumps({"a": self._snapshot_record("a", ["ghost"])}),
+            json.dumps({"a": self._snapshot_record("a", ["a"])}),
+            json.dumps({"a": self._snapshot_record("a", ["b", "b"]),
+                        "b": self._snapshot_record("b")}),
+            json.dumps({"a": {**self._snapshot_record("a"), "id": "other"}}),
+            json.dumps({"a": self._snapshot_record("a", ["b"]),
+                        "b": self._snapshot_record("b", ["a"])}),
+        ]
+        for raw in bad_states:
+            other = Path(self.temp.name) / "bad-catalog.json"
+            other.write_text(raw, encoding="utf-8")
+            with self.assertRaises(ValueError):
+                DatasetCatalog(other).preview_bundle(json.loads(good))
+
+    def test_preview_rejects_invalid_snapshot_like_diff(self):
+        self.catalog.register(self._snapshot_record("old"))
+        for bundle in ([], None, "x", 1, True, {}, {"datasets": None}, {"datasets": "x"},
+                       {"datasets": [self._snapshot_record("a"), self._snapshot_record("a")]},
+                       {"datasets": [self._snapshot_record("a", ["a"])]},
+                       {"datasets": [self._snapshot_record("a", ["ghost"])]},
+                       {"datasets": [self._snapshot_record("a", ["b"]),
+                                     self._snapshot_record("b", ["a"])]}):
+            with self.assertRaises(ValueError):
+                self.catalog.preview_bundle(bundle)
+
+    def test_preview_does_not_mutate_inputs_or_write_files(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"])]})
+        catalog_before = self.path.read_text(encoding="utf-8")
+        bundle = {"datasets": [
+            self._snapshot_record("a", description="changed"),
+            self._snapshot_record("b", ["a"]), self._snapshot_record("c", ["a"])]}
+        snapshot = json.loads(json.dumps(bundle))
+        result = self.catalog.preview_bundle(bundle)
+        self.assertEqual(bundle, snapshot)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+        result["affected"][0]["causes"][0]["before"]["path"] = ["tampered"]
+        again = self.catalog.preview_bundle(bundle)
+        self.assertEqual(again["affected"][0]["causes"][0]["before"]["path"], ["a", "b"])
+
+        nested = Path(self.temp.name) / "state" / "nested" / "catalog.json"
+        empty_catalog = DatasetCatalog(nested)
+        self.assertEqual(empty_catalog.preview_bundle({"datasets": []}),
+                         {"diff": {"added": [], "removed": [], "changed": []}, "affected": []})
+        self.assertFalse(nested.exists())
+        self.assertFalse(nested.parent.exists())
+
+    def test_preview_is_independent_of_input_order(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"]),
+            self._snapshot_record("c", ["b"])]})
+        descriptors = [self._snapshot_record("a", description="changed"),
+                       self._snapshot_record("b", ["a"]), self._snapshot_record("c", ["b"])]
+        first = self.catalog.preview_bundle({"datasets": descriptors})
+        second = self.catalog.preview_bundle({"datasets": list(reversed(descriptors))})
+        self.assertEqual(first, second)
+
+    def test_cli_preview_success_and_errors(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")],
+                       check=True, capture_output=True)
+        subprocess.run(prefix + ["register", str(ROOT / "samples/daily.json")],
+                       check=True, capture_output=True)
+        catalog_before = self.path.read_text(encoding="utf-8")
+
+        snapshot_path = Path(self.temp.name) / "snapshot.json"
+        snapshot_path.write_text(json.dumps({"datasets": [
+            {"id": "orders", "description": "Order amounts from the daily export",
+             "fields": [{"name": "order_id", "type": "string"},
+                        {"name": "amount", "type": "number"}], "depends_on": []},
+            {"id": "daily_totals", "description": "updated description",
+             "fields": [{"name": "day", "type": "string"}, {"name": "total", "type": "number"}],
+             "depends_on": ["orders"]}]}, ensure_ascii=False), encoding="utf-8")
+        run = subprocess.run(prefix + ["preview", str(snapshot_path)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual(set(result), {"diff", "affected"})
+        self.assertEqual(result["diff"]["changed"][0]["changed_keys"], ["description"])
+        self.assertEqual(result["affected"], [])
+        self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+
+        missing = subprocess.run(prefix + ["preview", str(Path(self.temp.name) / "nope.json")],
+                                 capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stdout))
+        bad_json = Path(self.temp.name) / "bad.json"
+        bad_json.write_text("{not json", encoding="utf-8")
+        run = subprocess.run(prefix + ["preview", str(bad_json)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+        invalid = Path(self.temp.name) / "invalid.json"
+        invalid.write_text(json.dumps({"datasets": [
+            {"id": "a", "fields": [{"name": "n", "type": "integer"}], "depends_on": ["a"]}]}),
+            encoding="utf-8")
+        run = subprocess.run(prefix + ["preview", str(invalid)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+        self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+
 
 if __name__ == "__main__":
     unittest.main()
