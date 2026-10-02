@@ -1283,6 +1283,130 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("error", json.loads(run.stdout))
         self.assertEqual(self.path.read_text(encoding="utf-8"), before)
 
+    def test_apply_expected_match_commits_and_returns_diff(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"])]})
+        expected = {"datasets": [
+            {**self._snapshot_record("b", ["a"]), "ignored": 1},
+            {"fields": [{"name": "n", "type": "integer", "extra": 2}],
+             "description": "a desc", "id": "a", "depends_on": []}]}
+        bundle = {"datasets": [
+            self._snapshot_record("a", description="updated"),
+            self._snapshot_record("c", ["a"])]}
+        result = self.catalog.apply_bundle(bundle, expected)
+        self.assertEqual([row["id"] for row in result["added"]], ["c"])
+        self.assertEqual([row["id"] for row in result["removed"]], ["b"])
+        self.assertEqual([row["id"] for row in result["changed"]], ["a"])
+        self.assertEqual([row["id"] for row in self.catalog.export()["datasets"]], ["a", "c"])
+
+    def test_apply_expected_mismatch_rejected_without_writing(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"])]})
+        before = self.path.read_text(encoding="utf-8")
+        expected = {"datasets": [self._snapshot_record("a")]}
+        with self.assertRaises(ValueError) as caught:
+            self.catalog.apply_bundle({"datasets": [self._snapshot_record("a")]}, expected)
+        self.assertEqual(str(caught.exception), "catalog does not match expected snapshot")
+        # mismatch is rejected even when the target equals the current state
+        with self.assertRaises(ValueError) as caught:
+            self.catalog.apply_bundle({"datasets": [
+                self._snapshot_record("a"), self._snapshot_record("b", ["a"])]}, expected)
+        self.assertEqual(str(caught.exception), "catalog does not match expected snapshot")
+        # field order, tag order/spelling and cleaned owner spelling still count
+        for index, record in enumerate((
+                {**self._snapshot_record("a"), "fields": [
+                    {"name": "m", "type": "string"}, {"name": "n", "type": "integer"}]},
+                {**self._snapshot_record("a"), "tags": ["x", "y"]},
+                {**self._snapshot_record("a"), "owner": "Team A"})):
+            catalog = DatasetCatalog(Path(self.temp.name) / ("other-" + str(index) + ".json"))
+            catalog.import_bundle({"datasets": [record]})
+            variant = json.loads(json.dumps(record))
+            if "fields" in record and len(record["fields"]) == 2:
+                variant["fields"] = list(reversed(variant["fields"]))
+            if "tags" in record:
+                variant["tags"] = list(reversed(variant["tags"]))
+            if "owner" in record:
+                variant["owner"] = "team a"
+            with self.assertRaises(ValueError):
+                catalog.apply_bundle({"datasets": [record]}, {"datasets": [variant]})
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_apply_expected_validated_and_empty_matches_only_empty(self):
+        nested = Path(self.temp.name) / "state" / "nested" / "catalog.json"
+        empty_catalog = DatasetCatalog(nested)
+        result = empty_catalog.apply_bundle({"datasets": []}, {"datasets": []})
+        self.assertEqual(result, {"added": [], "removed": [], "changed": []})
+        self.assertFalse(nested.exists())
+        self.assertFalse(nested.parent.exists())
+        with self.assertRaises(ValueError) as caught:
+            empty_catalog.apply_bundle({"datasets": []}, {"datasets": [self._snapshot_record("a")]})
+        self.assertEqual(str(caught.exception), "catalog does not match expected snapshot")
+        self.assertFalse(nested.exists())
+
+        self.catalog.register(self._snapshot_record("a"))
+        before = self.path.read_text(encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.catalog.apply_bundle({"datasets": []}, {"datasets": []})
+        bad_expected = [
+            [], "x", 1, True, {},
+            {"datasets": None}, {"other": []},
+            {"datasets": [{"id": "bad id", "fields": [{"name": "n", "type": "integer"}]}]},
+            {"datasets": [self._snapshot_record("a"), self._snapshot_record("a")]},
+            {"datasets": [self._snapshot_record("b", ["b"])]},
+            {"datasets": [self._snapshot_record("b", ["ghost"])]},
+            {"datasets": [self._snapshot_record("b", ["c", "c"]),
+                          self._snapshot_record("c")]},
+            {"datasets": [self._snapshot_record("b", ["c"]),
+                          self._snapshot_record("c", ["b"])]},
+        ]
+        for expected in bad_expected:
+            with self.assertRaises(ValueError):
+                self.catalog.apply_bundle({"datasets": [self._snapshot_record("a")]}, expected)
+            self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_cli_apply_expected(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")],
+                       check=True, capture_output=True)
+        subprocess.run(prefix + ["register", str(ROOT / "samples/daily.json")],
+                       check=True, capture_output=True)
+
+        expected_path = Path(self.temp.name) / "expected.json"
+        expected_path.write_text(json.dumps(self.catalog.export()), encoding="utf-8")
+        snapshot_path = Path(self.temp.name) / "snapshot.json"
+        snapshot_path.write_text(json.dumps({"datasets": [
+            {"id": "orders", "fields": [{"name": "order_id", "type": "string"}],
+             "depends_on": []}]}), encoding="utf-8")
+        run = subprocess.run(prefix + ["apply", str(snapshot_path), "--expected", str(expected_path)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual([row["id"] for row in result["removed"]], ["daily_totals"])
+        self.assertEqual([row["id"] for row in self.catalog.export()["datasets"]], ["orders"])
+
+        # the catalog changed, so the same expected snapshot no longer matches
+        before = self.path.read_text(encoding="utf-8")
+        run = subprocess.run(prefix + ["apply", str(snapshot_path), "--expected", str(expected_path)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertEqual(json.loads(run.stdout)["error"],
+                         "catalog does not match expected snapshot")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+        null_expected = Path(self.temp.name) / "null.json"
+        null_expected.write_text("null", encoding="utf-8")
+        run = subprocess.run(prefix + ["apply", str(snapshot_path), "--expected", str(null_expected)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+        missing = subprocess.run(
+            prefix + ["apply", str(snapshot_path), "--expected",
+                      str(Path(self.temp.name) / "nope.json")],
+            capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stdout))
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
 
 if __name__ == "__main__":
     unittest.main()

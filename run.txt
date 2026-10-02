@@ -28,4 +28,6 @@ python3 dataset_catalog.py apply FILE
 Commits a {"datasets":[...]} snapshot file as the complete catalog state (same-id records replaced,
 new ids added, absent records removed) and prints the pre-commit
 {"added":[...],"removed":[...],"changed":[...]} diff; all-or-nothing, errors exit 2.
+Pass --expected FILE to require the current catalog to match that expected snapshot first;
+a mismatch prints {"error":"catalog does not match expected snapshot"} and exits 2.
 python3 -B -m unittest -v
