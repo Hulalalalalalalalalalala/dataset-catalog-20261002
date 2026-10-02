@@ -47,6 +47,12 @@ and prints {"changes":[...]} sorted by dataset id; each item holds only id, adde
 removed_fields (name/type pairs), type_changes (name/before/after) and breaking, arrays sorted by
 field name; breaking is true for any removed field or non-integer-to-number type change;
 read-only, errors exit 2.
+python3 dataset_catalog.py relation-diff FILE
+Reviews read-only reachability changes against a complete {"datasets":[...]} snapshot
+(catalog = before) and prints {"added":[...],"removed":[...],"changed":[...]} sorted by
+source then target; each item holds only source, target, before and after, where
+before/after are null or {"distance": n, "path": [...]} (fewest dependency edges,
+lexicographically smallest shortest path, direction as in between); read-only, errors exit 2.
 python3 dataset_catalog.py apply FILE
 Commits a {"datasets":[...]} snapshot file as the complete catalog state (same-id records replaced,
 new ids added, absent records removed) and prints the pre-commit

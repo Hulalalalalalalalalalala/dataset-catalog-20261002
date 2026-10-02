@@ -598,6 +598,35 @@ class DatasetCatalog:
         current = self._current_state()
         return self._schema_diff_states(current, snapshot)
 
+    @staticmethod
+    def _relation_pairs(state):
+        downstream = _downstream_index(state)
+        pairs = {}
+        for source in state:
+            for target, path in _shortest_downstream_paths(downstream, source).items():
+                pairs[(source, target)] = {"distance": len(path) - 1, "path": path}
+        return pairs
+
+    def relation_diff_bundle(self, bundle):
+        snapshot = self._snapshot_state(bundle)
+        current = self._current_state()
+        before_pairs = self._relation_pairs(current)
+        after_pairs = self._relation_pairs(snapshot)
+        added = []
+        removed = []
+        changed = []
+        for source, target in sorted(set(before_pairs) | set(after_pairs)):
+            before = before_pairs.get((source, target))
+            after = after_pairs.get((source, target))
+            item = {"source": source, "target": target, "before": before, "after": after}
+            if before is None:
+                added.append(item)
+            elif after is None:
+                removed.append(item)
+            elif before != after:
+                changed.append(item)
+        return {"added": added, "removed": removed, "changed": changed}
+
     def _save_records(self, records):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = json.dumps(records, ensure_ascii=False, indent=2) + "\n"
@@ -649,6 +678,10 @@ def main():
                         help="review read-only field additions, removals and type changes against "
                              "a complete snapshot bundle"
                         ).add_argument("file")
+    commands.add_parser("relation-diff",
+                        help="review read-only reachability changes between dataset pairs against "
+                             "a complete snapshot bundle"
+                        ).add_argument("file")
     apply_cmd = commands.add_parser("apply",
                                     help="apply a snapshot bundle as the complete catalog state")
     apply_cmd.add_argument("file")
@@ -692,6 +725,8 @@ def main():
             result = catalog.preview_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "schema-diff":
             result = catalog.schema_diff_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
+        elif args.command == "relation-diff":
+            result = catalog.relation_diff_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "apply":
             bundle = json.loads(Path(args.file).read_text(encoding="utf-8"))
             if args.expected is None:
