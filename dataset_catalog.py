@@ -767,6 +767,41 @@ class DatasetCatalog:
             self._save_records({key: snapshot[key] for key in ordered})
         return diff
 
+    def merge_bundle(self, bundle):
+        if not isinstance(bundle, dict):
+            raise ValueError("bundle must be an object")
+        descriptors = bundle.get("datasets")
+        if not isinstance(descriptors, list):
+            raise ValueError("bundle must contain a datasets array")
+
+        batch_ids = set()
+        for dataset in descriptors:
+            if not isinstance(dataset, dict):
+                raise ValueError("invalid dataset descriptor")
+            identifier = dataset.get("id")
+            if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
+                raise ValueError("invalid dataset id")
+            if identifier in batch_ids:
+                raise ValueError("dataset already registered")
+            batch_ids.add(identifier)
+
+        current = self._current_state()
+        known = set(current) | batch_ids
+        merged = dict(current)
+        for dataset in descriptors:
+            entry = self._normalize_entry(dataset, known)
+            if entry["id"] in entry["depends_on"]:
+                raise ValueError("dependencies must be unique, already registered dataset ids")
+            merged[entry["id"]] = entry
+        ordered = _toposort(merged)
+        if ordered is None:
+            raise ValueError("dependency cycle detected")
+
+        diff = self._diff_states(current, merged)
+        if diff["added"] or diff["removed"] or diff["changed"]:
+            self._save_records({key: merged[key] for key in ordered})
+        return diff
+
 
 def _parse_max_depth(raw):
     if raw is None:
@@ -800,6 +835,10 @@ def main():
     apply_cmd.add_argument("--expected",
                            help="expected current-state snapshot file; the apply is rejected "
                                 "unless the catalog matches it")
+    merge_cmd = commands.add_parser(
+        "merge",
+        help="incrementally add or replace the datasets named in a bundle, keeping the rest")
+    merge_cmd.add_argument("file")
     commands.add_parser("describe").add_argument("id")
     commands.add_parser("dependencies").add_argument("id")
     impact = commands.add_parser("impact")
@@ -860,6 +899,8 @@ def main():
                 if expected is None:
                     raise ValueError("bundle must be an object")
                 result = catalog.apply_bundle(bundle, expected)
+        elif args.command == "merge":
+            result = catalog.merge_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "export":
             result = catalog.export(None if args.ids is None else args.ids)
         elif args.command == "common-upstream":
