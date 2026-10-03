@@ -28,6 +28,12 @@ enumeration), datasets sorted by id and edges sorted by source then target; the 
 ends returns that record and empty edges, registered but unreachable ends return two empty arrays,
 the whole catalog is validated even outside the chain (key/id mismatch included); read-only,
 errors exit 2.
+python3 dataset_catalog.py critical orders daily_totals
+Returns [daily_totals record, orders record]: the datasets every directed SOURCE->TARGET path
+passes through (full describe records, each once, sorted by id, no path enumeration); both ends
+are included when reachable, the same registered id for both ends returns that one record,
+registered but unreachable ends return [], and the reversed direction is judged independently;
+the whole catalog is validated even outside the queried paths; read-only, errors exit 2.
 python3 dataset_catalog.py export --id daily_totals
 Returns {"datasets":[orders record, daily_totals record]}, dependencies first.
 python3 dataset_catalog.py export-csv --id daily_totals

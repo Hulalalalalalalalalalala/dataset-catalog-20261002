@@ -388,6 +388,54 @@ class DatasetCatalog:
         edges.sort(key=lambda edge: (edge["source"], edge["target"]))
         return {"datasets": [records[key] for key in sorted(chain)], "edges": edges}
 
+    def critical(self, source, target):
+        for endpoint in (source, target):
+            if not isinstance(endpoint, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", endpoint):
+                raise ValueError("invalid dataset id")
+        records = self.entries()
+        if not isinstance(records, dict):
+            raise ValueError("invalid catalog state")
+        if source not in records or target not in records:
+            raise ValueError("unknown dataset")
+        current = self._current_state()
+        if source == target:
+            return [records[source]]
+        downstream = _downstream_index(current)
+        forward = set()
+        stack = [source]
+        while stack:
+            node = stack.pop()
+            if node in forward:
+                continue
+            forward.add(node)
+            stack.extend(downstream.get(node, ()))
+        if target not in forward:
+            return []
+        backward = set()
+        stack = [target]
+        while stack:
+            node = stack.pop()
+            if node in backward:
+                continue
+            backward.add(node)
+            stack.extend(current[node]["depends_on"])
+        chain = forward & backward  # nodes lying on at least one source -> target path
+        critical = {source, target}
+        for node in chain - critical:
+            # a chain node is critical only when removing it breaks every source -> target path
+            reached = {source}
+            stack = [source]
+            while stack:
+                parent = stack.pop()
+                for child in downstream.get(parent, ()):
+                    if child == node or child in reached or child not in chain:
+                        continue
+                    reached.add(child)
+                    stack.append(child)
+            if target not in reached:
+                critical.add(node)
+        return [records[key] for key in sorted(critical)]
+
     def export(self, identifiers=None):
         if identifiers is not None and not isinstance(identifiers, list):
             raise ValueError("identifiers must be None or a list of dataset ids")
@@ -773,6 +821,11 @@ def main():
         help="report every node and edge lying on a directed path from SOURCE to TARGET")
     between.add_argument("source")
     between.add_argument("target")
+    critical = commands.add_parser(
+        "critical",
+        help="report the datasets every directed path from SOURCE to TARGET passes through")
+    critical.add_argument("source")
+    critical.add_argument("target")
     search = commands.add_parser("search")
     search.add_argument("query", nargs="?", default="")
     search.add_argument("--field-type", dest="field_type")
@@ -811,6 +864,8 @@ def main():
             result = catalog.common_upstream([] if args.ids is None else args.ids)
         elif args.command == "between":
             result = catalog.between(args.source, args.target)
+        elif args.command == "critical":
+            result = catalog.critical(args.source, args.target)
         elif args.command == "impact":
             result = catalog.impact(args.id, max_depth=_parse_max_depth(args.max_depth))
         elif args.command == "upstream":

@@ -569,6 +569,161 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in result["datasets"]], ["daily_totals", "orders"])
         self.assertEqual(result["edges"], [{"source": "orders", "target": "daily_totals"}])
 
+    def test_critical_sample_orders_to_daily_totals(self):
+        sample = DatasetCatalog(ROOT / "samples" / "catalog.json")
+        result = sample.critical("orders", "daily_totals")
+        self.assertEqual([row["id"] for row in result], ["daily_totals", "orders"])
+        self.assertEqual({row["id"]: row for row in result},
+                         {"orders": sample.describe("orders"),
+                          "daily_totals": sample.describe("daily_totals")})
+
+    def test_critical_parallel_branches_return_only_the_endpoints(self):
+        self._write_records({
+            "a": self._record("a", []),
+            "b": self._record("b", ["a"]), "c": self._record("c", ["a"]),
+            "d": self._record("d", ["b", "c"]),
+            "side": self._record("side", ["a"]),
+            "lone": self._record("lone", [])})
+        result = self.catalog.critical("a", "d")
+        self.assertEqual([row["id"] for row in result], ["a", "d"])
+        self.assertEqual(result[-1], self.catalog.describe("d"))
+
+    def test_critical_converging_branches_keep_the_merge_node(self):
+        self._write_records({
+            "a": self._record("a", []),
+            "b": self._record("b", ["a"]), "c": self._record("c", ["a"]),
+            "m": self._record("m", ["b", "c"]),
+            "d": self._record("d", ["m"])})
+        self.assertEqual([row["id"] for row in self.catalog.critical("a", "d")],
+                         ["a", "d", "m"])
+
+    def test_critical_longer_bypass_excludes_the_merge_node(self):
+        self._write_records({
+            "a": self._record("a", []),
+            "b": self._record("b", ["a"]), "c": self._record("c", ["a"]),
+            "m": self._record("m", ["b", "c"]),
+            "e": self._record("e", ["a"]), "f": self._record("f", ["e"]),
+            "d": self._record("d", ["m", "f"])})
+        self.assertEqual([row["id"] for row in self.catalog.critical("a", "d")],
+                         ["a", "d"])
+
+    def test_critical_same_endpoint_returns_only_that_record(self):
+        self._write_records({"a": self._record("a", []), "b": self._record("b", ["a"])})
+        self.assertEqual(self.catalog.critical("a", "a"), [self.catalog.describe("a")])
+        self.assertEqual(self.catalog.critical("b", "b"), [self.catalog.describe("b")])
+
+    def test_critical_unreachable_and_reversed_direction_return_empty(self):
+        self._write_records({"a": self._record("a", []), "b": self._record("b", ["a"])})
+        self.assertEqual(self.catalog.critical("b", "a"), [])
+        self._write_records({
+            "a": self._record("a", []), "b": self._record("b", ["a"]),
+            "c": self._record("c", []), "d": self._record("d", ["c"])})
+        self.assertEqual(self.catalog.critical("a", "d"), [])
+
+    def test_critical_independent_of_record_and_dependency_order(self):
+        records = {
+            "a": self._record("a", []),
+            "b": self._record("b", ["a"]), "c": self._record("c", ["a"]),
+            "m": self._record("m", ["b", "c"]),
+            "d": self._record("d", ["m"])}
+        self._write_records(records)
+        result = self.catalog.critical("a", "d")
+        shuffled = {key: records[key] for key in reversed(list(records))}
+        shuffled["m"] = {**shuffled["m"], "depends_on": ["c", "b"]}
+        self._write_records(shuffled)
+        again = self.catalog.critical("a", "d")
+        self.assertEqual([row["id"] for row in again], [row["id"] for row in result])
+        self.assertEqual([row["id"] for row in again], ["a", "d", "m"])
+
+    def test_critical_validates_arguments_before_reading_catalog(self):
+        self.assertFalse(self.path.exists())
+        missing = DatasetCatalog(self.path)
+        for bad in ((1, "a"), (None, "a"), (True, "a"), ("", "a"), ("A", "a"),
+                    ("a b", "a"), ("a", 1), ("a", None), ("a", True), ("a", "")):
+            with self.assertRaises(ValueError):
+                missing.critical(*bad)
+        self.assertFalse(self.path.exists())
+        # well-formed but unregistered ids in a missing/empty catalog are unknown
+        with self.assertRaises(ValueError):
+            missing.critical("a", "b")
+        self.assertFalse(self.path.exists())
+        self.path.write_text("{}", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            DatasetCatalog(self.path).critical("a", "b")
+
+    def test_critical_validates_the_whole_catalog_even_outside_the_chain(self):
+        good = {"s": self._record("s", []), "t": self._record("t", ["s"])}
+        bad_states = (
+            ["not", "an", "object"],
+            {**good, "other": {"id": "else", "fields": [{"name": "n", "type": "integer"}]}},
+            {**good, "other": "not a descriptor"},
+            {**good, "other": self._record("other", ["ghost"])},
+        )
+        for state in bad_states:
+            self._write_records(state)
+            with self.assertRaises(ValueError):
+                self.catalog.critical("s", "t")
+        self._write_records({"s": {**self._record("s", []), "depends_on": ["t"]},
+                             "t": self._record("t", ["s"])})
+        with self.assertRaises(ValueError):
+            self.catalog.critical("s", "t")
+        # a failure outside the chain still errors on an otherwise empty result
+        self._write_records({**good, "other": "not a descriptor"})
+        with self.assertRaises(ValueError):
+            self.catalog.critical("t", "s")
+        # and on a same-endpoint query
+        with self.assertRaises(ValueError):
+            self.catalog.critical("s", "s")
+
+    def test_critical_is_read_only(self):
+        self._write_records({
+            "a": self._record("a", []),
+            "b": self._record("b", ["a"]), "c": self._record("c", ["a"]),
+            "d": self._record("d", ["b", "c"])})
+        before = self.path.read_text(encoding="utf-8")
+        self.catalog.critical("a", "d")
+        self.catalog.critical("d", "a")
+        self.catalog.critical("a", "a")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_cli_critical(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")],
+                       check=True, capture_output=True)
+        subprocess.run(prefix + ["register", str(ROOT / "samples/daily.json")],
+                       check=True, capture_output=True)
+        run = subprocess.run(prefix + ["critical", "orders", "daily_totals"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual([row["id"] for row in json.loads(run.stdout)],
+                         ["daily_totals", "orders"])
+        same = subprocess.run(prefix + ["critical", "orders", "orders"],
+                              capture_output=True, text=True)
+        self.assertEqual(same.returncode, 0)
+        self.assertEqual([row["id"] for row in json.loads(same.stdout)], ["orders"])
+        unreachable = subprocess.run(prefix + ["critical", "daily_totals", "orders"],
+                                     capture_output=True, text=True)
+        self.assertEqual(unreachable.returncode, 0)
+        self.assertEqual(json.loads(unreachable.stdout), [])
+        before = self.path.read_text(encoding="utf-8")
+        missing_arg = subprocess.run(prefix + ["critical", "orders"],
+                                     capture_output=True, text=True)
+        self.assertEqual(missing_arg.returncode, 2)
+        for bad_args in (["critical", "Bad", "orders"],
+                         ["critical", "orders", "nope"]):
+            failed = subprocess.run(prefix + bad_args, capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, bad_args)
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"}, bad_args)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_cli_critical_uses_default_catalog(self):
+        base = [sys.executable, str(ROOT / "dataset_catalog.py")]
+        run = subprocess.run(base + ["critical", "orders", "daily_totals"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual([row["id"] for row in json.loads(run.stdout)],
+                         ["daily_totals", "orders"])
+
     def test_cli_query_and_registration(self):
         prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
         run = subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")], capture_output=True, text=True)
