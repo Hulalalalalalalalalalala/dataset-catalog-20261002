@@ -789,6 +789,49 @@ class DatasetCatalog:
             self._save_records({key: merged[key] for key in ordered})
         return diff
 
+    def reconcile_bundle(self, base_bundle, incoming_bundle):
+        base = self._snapshot_state(base_bundle)
+        incoming = self._snapshot_state(incoming_bundle)
+        current = self._current_state()
+
+        candidate = {}
+        conflicts = []
+        for key in sorted(set(base) | set(current) | set(incoming)):
+            base_entry = base.get(key)
+            current_entry = current.get(key)
+            incoming_entry = incoming.get(key)
+            if current_entry == base_entry:
+                chosen = incoming_entry
+            elif incoming_entry == base_entry:
+                chosen = current_entry
+            elif current_entry == incoming_entry:
+                chosen = current_entry
+            else:
+                conflicts.append({"id": key,
+                                  "base": copy.deepcopy(base_entry),
+                                  "current": copy.deepcopy(current_entry),
+                                  "incoming": copy.deepcopy(incoming_entry)})
+                continue
+            if chosen is not None:
+                candidate[key] = chosen
+
+        if conflicts:
+            return {"bundle": None, "diff": None, "conflicts": conflicts}
+
+        # the merged graph is validated only once no record conflicts remain:
+        # per-side changes that are individually valid can still drop a
+        # dependency another kept record needs, or close a cycle
+        if any(dependency not in candidate
+               for entry in candidate.values() for dependency in entry["depends_on"]):
+            raise ValueError("missing dependency")
+        ordered = _toposort(candidate)
+        if ordered is None:
+            raise ValueError("dependency cycle detected")
+
+        bundle = {"datasets": [copy.deepcopy(candidate[key]) for key in ordered]}
+        return {"bundle": bundle, "diff": self._diff_states(current, candidate),
+                "conflicts": []}
+
     def _save_records(self, records):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = json.dumps(records, ensure_ascii=False, indent=2) + "\n"
@@ -854,6 +897,13 @@ def main():
                         help="merge a bundle into the catalog, adding or replacing only the "
                              "listed datasets and keeping every other record"
                         ).add_argument("file")
+    reconcile_cmd = commands.add_parser(
+        "reconcile",
+        help="preview a read-only three-way reconcile of the catalog against a common "
+             "base snapshot and an incoming snapshot, producing a candidate bundle "
+             "usable by apply when nothing conflicts")
+    reconcile_cmd.add_argument("base")
+    reconcile_cmd.add_argument("incoming")
     commands.add_parser("describe").add_argument("id")
     commands.add_parser("dependencies").add_argument("id")
     impact = commands.add_parser("impact")
@@ -917,6 +967,10 @@ def main():
                 result = catalog.apply_bundle(bundle, expected)
         elif args.command == "merge":
             result = catalog.merge_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
+        elif args.command == "reconcile":
+            base = json.loads(Path(args.base).read_text(encoding="utf-8"))
+            incoming = json.loads(Path(args.incoming).read_text(encoding="utf-8"))
+            result = catalog.reconcile_bundle(base, incoming)
         elif args.command == "export":
             result = catalog.export(None if args.ids is None else args.ids)
         elif args.command == "common-upstream":

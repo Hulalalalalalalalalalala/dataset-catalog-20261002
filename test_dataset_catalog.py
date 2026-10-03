@@ -3344,5 +3344,319 @@ class ExportCsvTests(unittest.TestCase):
         self.assertEqual(self.path.read_text(encoding="utf-8"), before)
 
 
+class ReconcileTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "catalog.json"
+        self.catalog = DatasetCatalog(self.path)
+
+    @staticmethod
+    def _record(identifier, depends_on=None, **extra):
+        entry = {"id": identifier, "description": extra.pop("description", ""),
+                 "fields": extra.pop("fields", [{"name": "n", "type": "integer"}]),
+                 "depends_on": sorted(depends_on or [])}
+        entry.update(extra)
+        return entry
+
+    def _write_records(self, *records):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps({entry["id"]: entry for entry in records}),
+                             encoding="utf-8")
+
+    def _bundle(self, *records):
+        return {"datasets": [dict(entry) for entry in records]}
+
+    def test_reconcile_combines_clean_changes_and_orders_dependencies_first(self):
+        base_a = self._record("a")
+        base_b = self._record("b", ["a"])
+        base_c = self._record("c")
+        self._write_records(self._record("a", description="current edit"), base_b, base_c)
+        incoming_c = self._record("c", description="incoming edit")
+        incoming_d = self._record("d", ["a"])
+        result = self.catalog.reconcile_bundle(
+            self._bundle(base_a, base_b, base_c),
+            self._bundle(base_a, base_b, incoming_c, incoming_d))
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual([entry["id"] for entry in result["bundle"]["datasets"]],
+                         ["a", "b", "c", "d"])
+        self.assertEqual(result["bundle"]["datasets"][0]["description"], "current edit")
+        self.assertEqual(result["bundle"]["datasets"][2]["description"], "incoming edit")
+        self.assertEqual(result["diff"]["removed"], [])
+        self.assertEqual([entry["id"] for entry in result["diff"]["added"]], ["d"])
+        self.assertEqual([entry["id"] for entry in result["diff"]["changed"]], ["c"])
+        self.assertEqual(result["diff"]["changed"][0]["changed_keys"], ["description"])
+
+    def test_reconcile_takes_incoming_when_current_matches_base(self):
+        base_a = self._record("a")
+        base_b = self._record("b")
+        self._write_records(base_a, base_b)
+        incoming_a = self._record("a", description="incoming edit", owner=" Team ")
+        result = self.catalog.reconcile_bundle(self._bundle(base_a, base_b),
+                                               self._bundle(incoming_a))
+        self.assertEqual(result["conflicts"], [])
+        by_id = {entry["id"]: entry for entry in result["bundle"]["datasets"]}
+        self.assertEqual(by_id["a"]["description"], "incoming edit")
+        self.assertEqual(by_id["a"]["owner"], "Team")  # owner cleaning still applies
+        self.assertNotIn("b", by_id)  # an incoming deletion of an untouched record wins
+        self.assertEqual([entry["id"] for entry in result["diff"]["removed"]], ["b"])
+        self.assertEqual([entry["id"] for entry in result["diff"]["changed"]], ["a"])
+
+    def test_reconcile_keeps_current_when_incoming_matches_base(self):
+        base_a = self._record("a")
+        base_b = self._record("b")
+        current_a = self._record("a", description="current edit", tags=[" Keep ", "keep"])
+        self._write_records(current_a, base_b)
+        result = self.catalog.reconcile_bundle(self._bundle(base_a, base_b),
+                                               self._bundle(base_a))
+        self.assertEqual(result["conflicts"], [])
+        by_id = {entry["id"]: entry for entry in result["bundle"]["datasets"]}
+        self.assertEqual(by_id["a"]["description"], "current edit")
+        self.assertEqual(by_id["a"]["tags"], ["Keep"])  # tag cleaning still applies
+        self.assertNotIn("b", by_id)  # an incoming deletion of an untouched record wins
+        self.assertEqual([entry["id"] for entry in result["diff"]["removed"]], ["b"])
+        self.assertEqual(result["diff"]["added"], [])
+        self.assertEqual(result["diff"]["changed"], [])
+
+    def test_reconcile_identical_changes_and_deletions_do_not_conflict(self):
+        base_a = self._record("a")
+        base_b = self._record("b")
+        changed_a = self._record("a", description="same edit")
+        self._write_records(changed_a)
+        result = self.catalog.reconcile_bundle(self._bundle(base_a, base_b),
+                                               self._bundle(changed_a))
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual([entry["id"] for entry in result["bundle"]["datasets"]], ["a"])
+        self.assertEqual(result["diff"], {"added": [], "removed": [], "changed": []})
+        # both sides adding the same id with equal normalized content is clean too
+        added = self._record("new", fields=[{"name": "x", "type": "string"}])
+        self._write_records(base_a, added)
+        result = self.catalog.reconcile_bundle(
+            self._bundle(base_a),
+            self._bundle(base_a, self._record("new", fields=[{"name": "x", "type": "string"}])))
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual([entry["id"] for entry in result["bundle"]["datasets"]], ["a", "new"])
+
+    def test_reconcile_conflicts_return_null_bundle_and_diff(self):
+        base_a = self._record("a")
+        base_b = self._record("b")
+        base_c = self._record("c")
+        self._write_records(self._record("a", description="current edit"),
+                            self._record("c", description="current edit"),
+                            self._record("both", description="current addition"))
+        result = self.catalog.reconcile_bundle(
+            self._bundle(base_a, base_b, base_c),
+            self._bundle(self._record("a", description="incoming edit"), base_b,
+                         self._record("both", description="incoming addition")))
+        self.assertIsNone(result["bundle"])
+        self.assertIsNone(result["diff"])
+        self.assertEqual([item["id"] for item in result["conflicts"]], ["a", "both", "c"])
+        by_id = {item["id"]: item for item in result["conflicts"]}
+        self.assertEqual(set(by_id["a"]), {"id", "base", "current", "incoming"})
+        # different modifications conflict even though different attributes changed
+        self.assertEqual(by_id["a"]["base"], base_a)
+        self.assertEqual(by_id["a"]["current"]["description"], "current edit")
+        self.assertEqual(by_id["a"]["incoming"]["description"], "incoming edit")
+        # different additions of the same id conflict, with null for the missing base
+        self.assertIsNone(by_id["both"]["base"])
+        self.assertEqual(by_id["both"]["current"]["description"], "current addition")
+        self.assertEqual(by_id["both"]["incoming"]["description"], "incoming addition")
+        # delete versus modify conflicts, with null for the deleted side
+        self.assertEqual(by_id["c"]["base"], base_c)
+        self.assertEqual(by_id["c"]["current"]["description"], "current edit")
+        self.assertIsNone(by_id["c"]["incoming"])
+
+    def test_reconcile_conflict_on_different_attributes_still_conflicts(self):
+        base_a = self._record("a")
+        self._write_records(self._record("a", description="current edit"))
+        result = self.catalog.reconcile_bundle(
+            self._bundle(base_a),
+            self._bundle(self._record("a", owner="someone")))
+        self.assertIsNone(result["bundle"])
+        self.assertIsNone(result["diff"])
+        self.assertEqual([item["id"] for item in result["conflicts"]], ["a"])
+
+    def test_reconcile_validates_candidate_graph(self):
+        base_a = self._record("a")
+        base_b = self._record("b")
+        # current repoints a onto b, incoming deletes b: each side is valid alone
+        self._write_records(self._record("a", ["b"]), base_b)
+        with self.assertRaises(ValueError):
+            self.catalog.reconcile_bundle(self._bundle(base_a, base_b),
+                                          self._bundle(base_a))
+        # current makes a depend on b, incoming makes b depend on a: a merged cycle
+        self._write_records(self._record("a", ["b"]), base_b)
+        with self.assertRaises(ValueError):
+            self.catalog.reconcile_bundle(self._bundle(base_a, base_b),
+                                          self._bundle(base_a, self._record("b", ["a"])))
+
+    def test_reconcile_validates_all_three_snapshots(self):
+        base_a = self._record("a")
+        self._write_records(base_a)
+        good = self._bundle(base_a)
+        for bad in (None, [], {}, {"datasets": None},
+                    {"datasets": [base_a, base_a]},  # duplicate id
+                    {"datasets": [{"id": "A!", "fields": [{"name": "n", "type": "integer"}]}]},
+                    {"datasets": [self._record("x", ["missing"])]},  # missing dependency
+                    {"datasets": [self._record("x", ["x"])]},  # self dependency
+                    {"datasets": [self._record("x", ["y"]), self._record("y", ["x"])]}):
+            with self.assertRaises(ValueError):
+                self.catalog.reconcile_bundle(bad, good)
+            with self.assertRaises(ValueError):
+                self.catalog.reconcile_bundle(good, bad)
+        # an invalid current catalog state is rejected too
+        self.path.write_text(json.dumps(
+            {"wrong_key": {"id": "other", "fields": [{"name": "n", "type": "integer"}],
+                           "depends_on": []}}), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.catalog.reconcile_bundle(good, good)
+        self.path.write_text('["not", "an", "object"]', encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.catalog.reconcile_bundle(good, good)
+
+    def test_reconcile_missing_catalog_is_empty_and_unreadable_raises(self):
+        base_a = self._record("a")
+        result = self.catalog.reconcile_bundle(self._bundle(), self._bundle(base_a))
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual([entry["id"] for entry in result["bundle"]["datasets"]], ["a"])
+        self.assertEqual([entry["id"] for entry in result["diff"]["added"]], ["a"])
+        self.assertFalse(self.path.exists())
+        with self.assertRaises(OSError):
+            DatasetCatalog(Path(self.temp.name)).reconcile_bundle(self._bundle(), self._bundle())
+
+    def test_reconcile_does_not_mutate_inputs_or_share_records(self):
+        import copy as copy_module
+        base_a = self._record("a")
+        current_a = self._record("a", description="current edit")
+        incoming_a = self._record("a", description="incoming edit")
+        self._write_records(current_a)
+        base = self._bundle(base_a)
+        incoming = self._bundle(incoming_a)
+        base_copy = copy_module.deepcopy(base)
+        incoming_copy = copy_module.deepcopy(incoming)
+        result = self.catalog.reconcile_bundle(base, incoming)
+        self.assertEqual(base, base_copy)
+        self.assertEqual(incoming, incoming_copy)
+        # mutating the conflict records touches neither the inputs nor later calls
+        result["conflicts"][0]["current"]["description"] = "tampered"
+        result = self.catalog.reconcile_bundle(base, incoming)
+        self.assertEqual(result["conflicts"][0]["current"]["description"], "current edit")
+        # mutating a clean result's bundle and diff touches nothing either
+        self._write_records(base_a)
+        catalog_before = self.path.read_text(encoding="utf-8")
+        clean = self.catalog.reconcile_bundle(self._bundle(base_a), self._bundle(incoming_a))
+        clean["bundle"]["datasets"][0]["description"] = "tampered"
+        clean["diff"]["changed"][0]["after"]["description"] = "tampered"
+        again = self.catalog.reconcile_bundle(self._bundle(base_a), self._bundle(incoming_a))
+        self.assertEqual(again["bundle"]["datasets"][0]["description"], "incoming edit")
+        self.assertEqual(again["diff"]["changed"][0]["after"]["description"], "incoming edit")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+
+    def test_reconcile_result_independent_of_input_order(self):
+        base_a = self._record("a")
+        base_b = self._record("b", ["a"])
+        base_c = self._record("c")
+        current_c = self._record("c", description="current edit")
+        incoming_a = self._record("a", description="incoming edit")
+        self._write_records(base_a, base_b, current_c)
+        first = self.catalog.reconcile_bundle(
+            self._bundle(base_a, base_b, base_c),
+            self._bundle(base_c, incoming_a, base_b))
+        second = self.catalog.reconcile_bundle(
+            self._bundle(base_c, base_b, base_a),
+            self._bundle(base_b, base_c, incoming_a))
+        self.assertEqual(first, second)
+
+    def test_reconcile_normalization_matches_diff_comparison(self):
+        # field order, tag retention/order and cleaned owner spelling all count;
+        # dataset order, dependency order and unsaved extra properties do not
+        base_a = self._record("a", tags=["One", "two"], owner="Team",
+                              fields=[{"name": "x", "type": "string"},
+                                      {"name": "y", "type": "integer"}])
+        self._write_records(base_a)
+        reordered = {"id": "a", "description": "", "depends_on": [],
+                     "fields": [{"name": "x", "type": "string"},
+                                {"name": "y", "type": "integer"}],
+                     "tags": ["One", "two"], "owner": "  Team  ", "extra": "ignored"}
+        result = self.catalog.reconcile_bundle(self._bundle(base_a), {"datasets": [reordered]})
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual(result["diff"], {"added": [], "removed": [], "changed": []})
+        # a field-order difference on the incoming side alone is a clean incoming change
+        swapped = dict(reordered, fields=[{"name": "y", "type": "integer"},
+                                          {"name": "x", "type": "string"}])
+        result = self.catalog.reconcile_bundle(self._bundle(base_a), {"datasets": [swapped]})
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual(result["diff"]["changed"][0]["changed_keys"], ["fields"])
+
+    def test_cli_reconcile_success_and_errors(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")],
+                       check=True, capture_output=True)
+        subprocess.run(prefix + ["register", str(ROOT / "samples/daily.json")],
+                       check=True, capture_output=True)
+        catalog_before = self.path.read_text(encoding="utf-8")
+        catalog = json.loads(catalog_before)
+        base_path = Path(self.temp.name) / "base.json"
+        base_path.write_text(json.dumps({"datasets": list(catalog.values())}),
+                             encoding="utf-8")
+        incoming_path = Path(self.temp.name) / "incoming.json"
+        incoming_path.write_text(json.dumps({"datasets": [
+            dict(catalog["orders"], description="incoming edit"),
+            catalog["daily_totals"],
+            {"id": "report", "fields": [{"name": "id", "type": "string"}],
+             "depends_on": ["daily_totals"]}]}), encoding="utf-8")
+        run = subprocess.run(prefix + ["reconcile", str(base_path), str(incoming_path)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual(set(result), {"bundle", "diff", "conflicts"})
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual([entry["id"] for entry in result["bundle"]["datasets"]],
+                         ["orders", "daily_totals", "report"])
+        self.assertEqual([entry["id"] for entry in result["diff"]["added"]], ["report"])
+        self.assertEqual([entry["id"] for entry in result["diff"]["changed"]], ["orders"])
+        self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+
+        # a conflicting incoming change still exits 0 with null bundle and diff
+        conflicting_path = Path(self.temp.name) / "conflicting.json"
+        conflicting_path.write_text(json.dumps({"datasets": [
+            dict(catalog["orders"], description="other edit"),
+            catalog["daily_totals"]]}), encoding="utf-8")
+        diverged_base = Path(self.temp.name) / "diverged_base.json"
+        diverged_base.write_text(json.dumps({"datasets": [
+            dict(catalog["orders"], description="base text"),
+            catalog["daily_totals"]]}), encoding="utf-8")
+        run = subprocess.run(prefix + ["reconcile", str(diverged_base), str(conflicting_path)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertIsNone(result["bundle"])
+        self.assertIsNone(result["diff"])
+        self.assertEqual([item["id"] for item in result["conflicts"]], ["orders"])
+
+        missing = subprocess.run(prefix + ["reconcile", str(Path(self.temp.name) / "nope.json"),
+                                           str(incoming_path)],
+                                 capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stdout))
+
+        bad_json = Path(self.temp.name) / "bad.json"
+        bad_json.write_text("{not json", encoding="utf-8")
+        run = subprocess.run(prefix + ["reconcile", str(bad_json), str(incoming_path)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+
+        invalid = Path(self.temp.name) / "invalid.json"
+        invalid.write_text(json.dumps({"datasets": [
+            {"id": "a", "fields": [{"name": "n", "type": "integer"}], "depends_on": ["a"]}]}),
+            encoding="utf-8")
+        run = subprocess.run(prefix + ["reconcile", str(base_path), str(invalid)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+        self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
+
+
 if __name__ == "__main__":
     unittest.main()
