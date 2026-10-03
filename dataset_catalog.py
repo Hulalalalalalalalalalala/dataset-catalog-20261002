@@ -388,6 +388,46 @@ class DatasetCatalog:
         edges.sort(key=lambda edge: (edge["source"], edge["target"]))
         return {"datasets": [records[key] for key in sorted(chain)], "edges": edges}
 
+    def critical(self, source, target):
+        for endpoint in (source, target):
+            if not isinstance(endpoint, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", endpoint):
+                raise ValueError("invalid dataset id")
+        records = self.entries()
+        if not isinstance(records, dict):
+            raise ValueError("invalid catalog state")
+        if source not in records or target not in records:
+            raise ValueError("unknown dataset")
+        current = self._current_state()
+        if source == target:
+            return [records[source]]
+        downstream = _downstream_index(current)
+        reachable = {source}
+        stack = [source]
+        while stack:
+            node = stack.pop()
+            for child in downstream.get(node, ()):
+                if child not in reachable:
+                    reachable.add(child)
+                    stack.append(child)
+        if target not in reachable:
+            return []
+        # dominators of target = datasets shared by every source -> target path;
+        # one topological pass suffices in this acyclic graph
+        order = [key for key in _toposort(current) if key in reachable]
+        dominators = {}
+        for node in order:
+            if node == source:
+                dominators[node] = {source}
+                continue
+            common = None
+            for parent in current[node]["depends_on"]:
+                if parent not in reachable:
+                    continue
+                common = dominators[parent].copy() if common is None else common & dominators[parent]
+            common.add(node)
+            dominators[node] = common
+        return [records[key] for key in sorted(dominators[target])]
+
     def export(self, identifiers=None):
         if identifiers is not None and not isinstance(identifiers, list):
             raise ValueError("identifiers must be None or a list of dataset ids")
@@ -773,6 +813,11 @@ def main():
         help="report every node and edge lying on a directed path from SOURCE to TARGET")
     between.add_argument("source")
     between.add_argument("target")
+    critical = commands.add_parser(
+        "critical",
+        help="report every dataset that all directed paths from SOURCE to TARGET pass through")
+    critical.add_argument("source")
+    critical.add_argument("target")
     search = commands.add_parser("search")
     search.add_argument("query", nargs="?", default="")
     search.add_argument("--field-type", dest="field_type")
@@ -811,6 +856,8 @@ def main():
             result = catalog.common_upstream([] if args.ids is None else args.ids)
         elif args.command == "between":
             result = catalog.between(args.source, args.target)
+        elif args.command == "critical":
+            result = catalog.critical(args.source, args.target)
         elif args.command == "impact":
             result = catalog.impact(args.id, max_depth=_parse_max_depth(args.max_depth))
         elif args.command == "upstream":

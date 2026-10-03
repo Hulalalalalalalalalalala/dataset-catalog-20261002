@@ -28,6 +28,17 @@ enumeration), datasets sorted by id and edges sorted by source then target; the 
 ends returns that record and empty edges, registered but unreachable ends return two empty arrays,
 the whole catalog is validated even outside the chain (key/id mismatch included); read-only,
 errors exit 2.
+python3 dataset_catalog.py critical orders daily_totals
+Returns the plain JSON array [orders record, daily_totals record]: every dataset that all directed
+SOURCE->TARGET paths pass through (B's depends_on containing A means A->B), as the same full records
+describe prints, one per dataset, sorted by id, with no path collection. The same registered id for
+both ends returns that one record; registered but unreachable ends return [], and the reversed
+direction is judged independently. In a fork where a reaches d through b or c only a and d return,
+branches merging at m before d also return m, and a new longer path bypassing m excludes it; path
+length, catalog key order and dependency order never change results, side branches and isolated
+records stay out. Endpoint formats are checked against the id rule before reading the catalog and
+unregistered ends raise; the whole catalog is validated with preview's rules even outside the query
+and for equal ends; read-only, errors exit 2.
 python3 dataset_catalog.py export --id daily_totals
 Returns {"datasets":[orders record, daily_totals record]}, dependencies first.
 python3 dataset_catalog.py export-csv --id daily_totals
