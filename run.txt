@@ -51,6 +51,13 @@ python3 dataset_catalog.py search "daily amount"
 Returns only orders with matched_fields ["amount"]; search is read-only.
 python3 dataset_catalog.py search --field-type integer
 Lists datasets having an integer field; an omitted query means no keyword restriction.
+python3 dataset_catalog.py search amount --upstream-of daily_totals
+Searches only the start dataset and its direct and indirect upstream along depends_on; returns
+only orders (merged upstream is searched once and the start need not match); search total with
+--upstream-of orders returns []; keywords and the other filters keep their semantics in range,
+key and dependency order never change the result, and omitting the flag searches the whole
+catalog; the closure is validated like upstream even when filters hide the bad record; an
+illegal or unregistered --upstream-of id, invalid JSON or an unreadable file exits 2 with error.
 python3 dataset_catalog.py diff FILE
 Compares the catalog (before) with a {"datasets":[...]} snapshot file (after, treated as complete)
 and prints {"added":[...],"removed":[...],"changed":[...]} sorted by id; read-only, errors exit 2.

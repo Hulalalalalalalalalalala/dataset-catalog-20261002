@@ -207,17 +207,32 @@ class DatasetCatalog:
             raise ValueError("unknown dataset")
         return records[identifier]
 
-    def search(self, query="", field_type=None, tags=None, owner=None):
+    def search(self, query="", field_type=None, tags=None, owner=None, upstream_of=None):
         if not isinstance(query, str):
             raise ValueError("query must be a string")
         if field_type is not None and field_type not in FIELD_TYPES:
             raise ValueError("field_type must be None or one of string, integer, number, boolean")
         required_tags = _normalize_tags(tags) if tags is not None else []
         required_owner = _normalize_owner(owner).casefold() if owner is not None else None
+        if upstream_of is not None and (
+                not isinstance(upstream_of, str)
+                or not re.fullmatch(r"[a-z][a-z0-9_-]*", upstream_of)):
+            raise ValueError("invalid dataset id")
         words = {word.casefold() for word in query.split()}
         records = self.entries()
+        scope = None
+        if upstream_of is not None:
+            if not isinstance(records, dict):
+                raise ValueError("invalid catalog state")
+            if upstream_of not in records:
+                raise ValueError("unknown dataset")
+            # validate the start and its whole upstream closure before any filtering,
+            # the same way upstream() does; records outside the closure are ignored
+            scope = set(_validated_upstream_closure(records, upstream_of))
         results = []
         for identifier in sorted(records):
+            if scope is not None and identifier not in scope:
+                continue
             entry = records[identifier]
             if field_type is not None and not any(field["type"] == field_type for field in entry["fields"]):
                 continue
@@ -872,6 +887,7 @@ def main():
     search.add_argument("--field-type", dest="field_type")
     search.add_argument("--tag", action="append", dest="tags")
     search.add_argument("--owner", dest="owner")
+    search.add_argument("--upstream-of", dest="upstream_of")
     args = parser.parse_args()
     try:
         catalog = DatasetCatalog(args.catalog)
@@ -914,7 +930,8 @@ def main():
         elif args.command == "upstream":
             result = catalog.upstream(args.id, max_depth=_parse_max_depth(args.max_depth))
         elif args.command == "search":
-            result = catalog.search(args.query, args.field_type, args.tags, args.owner)
+            result = catalog.search(args.query, args.field_type, args.tags, args.owner,
+                                    args.upstream_of)
         else:
             result = getattr(catalog, args.command)(args.id)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))

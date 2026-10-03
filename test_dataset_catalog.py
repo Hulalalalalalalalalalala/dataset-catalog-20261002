@@ -880,6 +880,179 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(json.loads(run.stdout), [])
         self.assertFalse(self.path.exists())
 
+    def test_search_upstream_of_sample_scenarios(self):
+        sample = DatasetCatalog(ROOT / "samples" / "catalog.json")
+        result = sample.search("amount", upstream_of="daily_totals")
+        self.assertEqual([row["dataset"]["id"] for row in result], ["orders"])
+        self.assertEqual(result[0]["dataset"], sample.describe("orders"))
+        self.assertEqual(result[0]["matched_fields"], ["amount"])
+        self.assertEqual(set(result[0]), {"dataset", "matched_fields"})
+        self.assertEqual(sample.search("total", upstream_of="orders"), [])
+
+    def test_search_upstream_of_includes_start_and_whole_closure_once(self):
+        self._write_records({
+            "base": {"id": "base", "description": "",
+                     "fields": [{"name": "amount_b", "type": "number"}], "depends_on": []},
+            "left": {"id": "left", "description": "",
+                     "fields": [{"name": "n", "type": "integer"}], "depends_on": ["base"]},
+            "right": {"id": "right", "description": "",
+                      "fields": [{"name": "n", "type": "integer"}], "depends_on": ["base"]},
+            "top": {"id": "top", "description": "",
+                    "fields": [{"name": "total", "type": "number"}], "depends_on": ["left", "right"]},
+            "unrelated": {"id": "unrelated", "description": "amount_b",
+                          "fields": [{"name": "amount_b", "type": "number"}], "depends_on": []}})
+        # the merge node base is searched once and out-of-scope records never match
+        result = self.catalog.search("amount_b", upstream_of="top")
+        self.assertEqual([row["dataset"]["id"] for row in result], ["base"])
+        self.assertEqual(result[0]["matched_fields"], ["amount_b"])
+        # the start matches an empty keyword query together with its whole closure
+        self.assertEqual([row["dataset"]["id"]
+                          for row in self.catalog.search(upstream_of="top")],
+                         ["base", "left", "right", "top"])
+        # the start not matching the keyword never stops its upstream from being searched
+        result = self.catalog.search("total", upstream_of="top")
+        self.assertEqual([row["dataset"]["id"] for row in result], ["top"])
+        result = self.catalog.search("amount_b", upstream_of="left")
+        self.assertEqual([row["dataset"]["id"] for row in result], ["base"])
+        # a leaf start searches only itself
+        self.assertEqual([row["dataset"]["id"]
+                          for row in self.catalog.search("amount_b", upstream_of="base")],
+                         ["base"])
+
+    def test_search_upstream_of_filters_apply_together_within_the_range(self):
+        self._write_records({
+            "base": {"id": "base", "description": "",
+                     "fields": [{"name": "amount_b", "type": "number"}], "depends_on": [],
+                     "tags": ["Finance"], "owner": "Al"},
+            "top": {"id": "top", "description": "",
+                    "fields": [{"name": "total", "type": "number"}], "depends_on": ["base"]}})
+        self.assertEqual([row["dataset"]["id"]
+                          for row in self.catalog.search(
+                              "amount", field_type="number", tags=["finance"], owner="al",
+                              upstream_of="top")],
+                         ["base"])
+        # the field-type filter never narrows which fields the keywords search
+        result = self.catalog.search("total", field_type="number", upstream_of="top")
+        self.assertEqual([row["dataset"]["id"] for row in result], ["top"])
+        self.assertEqual(result[0]["matched_fields"], ["total"])
+        self.assertEqual(self.catalog.search(
+            "amount", field_type="integer", upstream_of="top"), [])
+        self.assertEqual(self.catalog.search(
+            "amount", tags=["missing"], upstream_of="top"), [])
+        self.assertEqual(self.catalog.search(
+            "amount", owner="someone", upstream_of="top"), [])
+
+    def test_search_upstream_of_is_independent_of_order_and_read_only(self):
+        self._write_records({
+            "top": {"id": "top", "description": "",
+                    "fields": [{"name": "n", "type": "integer"}], "depends_on": ["right", "left"]},
+            "right": {"id": "right", "description": "",
+                      "fields": [{"name": "n", "type": "integer"}], "depends_on": ["base"]},
+            "base": {"id": "base", "description": "shared amount",
+                     "fields": [{"name": "amount_b", "type": "number"}], "depends_on": []},
+            "left": {"id": "left", "description": "",
+                     "fields": [{"name": "n", "type": "integer"}], "depends_on": ["base"]}})
+        first = self.catalog.search("amount", upstream_of="top")
+        before = self.path.read_text(encoding="utf-8")
+        second = self.catalog.search("amount", upstream_of="top")
+        self.assertEqual(first, second)
+        self.assertEqual([row["dataset"]["id"] for row in first], ["base"])
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_search_upstream_of_validates_argument_before_reading_catalog(self):
+        self.assertFalse(self.path.exists())
+        missing = DatasetCatalog(self.path)
+        for bad in ("", 1, True, b"x", ["a"], 1.5):
+            with self.assertRaises(ValueError):
+                missing.search("q", upstream_of=bad)
+        self.assertEqual(missing.search("q", upstream_of=None), missing.search("q"))
+        self.assertFalse(self.path.exists())
+        # well-formed but unregistered in a missing catalog never creates the file
+        with self.assertRaises(ValueError):
+            missing.search(upstream_of="orders")
+        self.assertFalse(self.path.exists())
+        self._write_records({})
+        with self.assertRaises(ValueError):
+            DatasetCatalog(self.path).search(upstream_of="orders")
+
+    def test_search_upstream_of_validates_the_full_closure_even_when_filtered_out(self):
+        bad_states = (
+            ["not", "an", "object"],
+            {"top": {"id": "other", "fields": [{"name": "n", "type": "integer"}]}},
+            {"top": {"id": "top", "fields": [{"name": "n", "type": "integer"}],
+                     "depends_on": ["top"]}},
+            {"top": {"id": "top", "fields": [{"name": "n", "type": "integer"}],
+                     "depends_on": ["mid", "mid"]},
+             "mid": {"id": "mid", "fields": [{"name": "n", "type": "integer"}]}},
+            {"top": {"id": "top", "fields": [{"name": "n", "type": "float"}]}},
+            {"top": {"id": "top", "fields": [{"name": "n", "type": "integer"}],
+                     "depends_on": ["mid"]},
+             "mid": {"id": "mid", "fields": [{"name": "n", "type": "integer"}],
+                     "depends_on": ["top"]}},
+        )
+        for state in bad_states:
+            self._write_records(state)
+            with self.assertRaises(ValueError):
+                self.catalog.search(upstream_of="top")
+        self._write_records({"top": {"id": "top", "fields": [{"name": "n", "type": "integer"}],
+                                     "depends_on": ["missing"]}})
+        with self.assertRaises(ValueError):
+            self.catalog.search(upstream_of="top")
+        # a broken record the keywords and filters would exclude is still rejected
+        self._write_records({
+            "top": {"id": "top", "fields": [{"name": "n", "type": "integer"}],
+                    "depends_on": ["broken"]},
+            "broken": {"id": "broken", "fields": [{"name": "n", "type": "integer"}],
+                       "depends_on": ["ghost"]}})
+        for kwargs in (dict(query="nothing-matches", upstream_of="top"),
+                       dict(field_type="boolean", upstream_of="top"),
+                       dict(tags=["missing"], upstream_of="top"),
+                       dict(owner="missing", upstream_of="top")):
+            with self.assertRaises(ValueError):
+                self.catalog.search(**kwargs)
+
+    def test_search_upstream_of_ignores_records_and_relations_outside_closure(self):
+        self._write_records({
+            "base": {"id": "base", "fields": [{"name": "n", "type": "integer"}]},
+            "top": {"id": "top", "fields": [{"name": "n", "type": "integer"}],
+                    "depends_on": ["base"]},
+            "corrupt": "not a descriptor",
+            "cyclic": {"id": "cyclic", "fields": [{"name": "n", "type": "integer"}],
+                       "depends_on": ["cyclic"]},
+            "dangling": {"id": "dangling", "fields": [{"name": "n", "type": "integer"}],
+                         "depends_on": ["ghost"]}})
+        self.assertEqual([row["dataset"]["id"]
+                          for row in self.catalog.search(upstream_of="top")],
+                         ["base", "top"])
+
+    def test_cli_search_upstream_of(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")],
+                       check=True, capture_output=True)
+        subprocess.run(prefix + ["register", str(ROOT / "samples/daily.json")],
+                       check=True, capture_output=True)
+        run = subprocess.run(prefix + ["search", "amount", "--upstream-of", "daily_totals"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual([row["dataset"]["id"] for row in result], ["orders"])
+        self.assertEqual(result[0]["matched_fields"], ["amount"])
+        whole = subprocess.run(prefix + ["search", "--upstream-of", "daily_totals"],
+                               capture_output=True, text=True)
+        self.assertEqual(whole.returncode, 0, whole.stderr)
+        self.assertEqual([row["dataset"]["id"] for row in json.loads(whole.stdout)],
+                         ["daily_totals", "orders"])
+        empty = subprocess.run(prefix + ["search", "total", "--upstream-of", "orders"],
+                               capture_output=True, text=True)
+        self.assertEqual(empty.returncode, 0, empty.stderr)
+        self.assertEqual(json.loads(empty.stdout), [])
+        for bad_args in (["search", "--upstream-of", "missing"],
+                         ["search", "--upstream-of", "Bad.Id"],
+                         ["search", "--upstream-of", ""]):
+            failed = subprocess.run(prefix + bad_args, capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, bad_args)
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"}, bad_args)
+
     def _record(self, identifier, depends_on):
         return {"id": identifier, "description": "",
                 "fields": [{"name": "n", "type": "integer"}], "depends_on": depends_on}
