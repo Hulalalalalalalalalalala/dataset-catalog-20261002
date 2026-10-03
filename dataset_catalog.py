@@ -253,13 +253,15 @@ class DatasetCatalog:
         if max_depth is not None and (isinstance(max_depth, bool)
                                       or not isinstance(max_depth, int) or max_depth <= 0):
             raise ValueError("max_depth must be None or a positive integer")
+        if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
+            raise ValueError("invalid dataset id")
         records = self.entries()
+        if not isinstance(records, dict):
+            raise ValueError("invalid catalog state")
         if identifier not in records:
             raise ValueError("unknown dataset")
-        downstream = {}
-        for key, entry in records.items():
-            for source in entry["depends_on"]:
-                downstream.setdefault(source, set()).add(key)
+        current = self._current_state()
+        downstream = _downstream_index(current)
         reached = {identifier: [identifier]}
         frontier = {identifier: [identifier]}
         result = []
