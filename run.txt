@@ -84,4 +84,16 @@ depends_on stores []), unlisted records are kept and nothing is deleted. Prints 
 {"added":[...],"removed":[...],"changed":[...]} diff as diff (removed always empty); an empty
 or no-change batch prints three empty arrays without writing. The whole current catalog and
 the merged dependency graph are validated before the atomic commit; errors exit 2.
+python3 dataset_catalog.py reconcile BASE INCOMING
+Previews a read-only three-way reconcile of two complete {"datasets":[...]} snapshot files
+against the current catalog: records equal to the base take the incoming version, records
+whose incoming version equals the base keep the current version, identical changes are
+adopted, and anything else (different additions, delete-vs-modify, different modifications)
+is a whole-record conflict, never merged field by field. Prints
+{"bundle":...,"diff":...,"conflicts":[...]}: with conflicts bundle and diff are null and
+conflicts lists each id sorted by id with only id/base/current/incoming (null when the
+record is missing on that side); otherwise conflicts is [], bundle is the apply-ready
+candidate snapshot (dependencies first) and diff compares the catalog with it. All three
+states and the merged candidate graph are validated (missing dependency or cycle included);
+read-only, errors exit 2.
 python3 -B -m unittest -v
