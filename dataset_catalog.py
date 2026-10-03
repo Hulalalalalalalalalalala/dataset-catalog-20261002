@@ -859,6 +859,41 @@ class DatasetCatalog:
         return diff
 
 
+    def remove(self, identifiers, cascade=False):
+        if not isinstance(identifiers, list):
+            raise ValueError("identifiers must be a list of dataset ids")
+        if not isinstance(cascade, bool):
+            raise ValueError("cascade must be a boolean")
+        selected = []
+        for item in identifiers:
+            if not isinstance(item, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", item):
+                raise ValueError("invalid dataset id")
+            if item not in selected:
+                selected.append(item)
+        current = self._current_state()
+        if any(item not in current for item in selected):
+            raise ValueError("unknown dataset")
+        downstream = _downstream_index(current)
+        targets = set(selected)
+        reached = set()  # downstream records outside the explicit selection
+        stack = list(targets)
+        while stack:
+            node = stack.pop()
+            for child in downstream.get(node, ()):
+                if child not in targets and child not in reached:
+                    reached.add(child)
+                    stack.append(child)
+        if reached and not cascade:
+            raise ValueError("cannot remove datasets that still have downstream dependents")
+        targets |= reached  # a no-op unless cascade is enabled
+        remaining = {key: entry for key, entry in current.items() if key not in targets}
+        diff = self._diff_states(current, remaining)
+        if targets:
+            ordered = _toposort(remaining)
+            self._save_records({key: remaining[key] for key in ordered})
+        return diff
+
+
 def _parse_max_depth(raw):
     if raw is None:
         return None
@@ -895,6 +930,13 @@ def main():
                         help="merge a bundle into the catalog, adding or replacing only the "
                              "listed datasets and keeping every other record"
                         ).add_argument("file")
+    remove_cmd = commands.add_parser(
+        "remove",
+        help="remove the datasets named by repeated --id flags; with --cascade every "
+             "reachable downstream dataset is removed too, otherwise the request is "
+             "rejected while any unselected dataset still depends on a selected one")
+    remove_cmd.add_argument("--id", action="append", dest="ids")
+    remove_cmd.add_argument("--cascade", action="store_true")
     reconcile_cmd = commands.add_parser(
         "reconcile",
         help="preview a read-only three-way reconcile of the BASE and INCOMING snapshot "
@@ -965,6 +1007,8 @@ def main():
                 result = catalog.apply_bundle(bundle, expected)
         elif args.command == "merge":
             result = catalog.merge_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
+        elif args.command == "remove":
+            result = catalog.remove([] if args.ids is None else args.ids, cascade=args.cascade)
         elif args.command == "reconcile":
             base = json.loads(Path(args.base).read_text(encoding="utf-8"))
             incoming = json.loads(Path(args.incoming).read_text(encoding="utf-8"))

@@ -96,4 +96,14 @@ record is missing on that side); otherwise conflicts is [], bundle is the apply-
 candidate snapshot (dependencies first) and diff compares the catalog with it. All three
 states and the merged candidate graph are validated (missing dependency or cycle included);
 read-only, errors exit 2.
+python3 dataset_catalog.py remove --id orders --cascade
+Deletes the datasets named by repeated --id flags (duplicates merge, input order irrelevant,
+no --id is an empty selection) and, with --cascade, every dataset reachable downstream of a
+selected one. Without --cascade only the explicitly selected records are deleted and the
+request is rejected (exit 2) while any unselected dataset still depends directly or
+indirectly on a selected one; edges are never rewritten. Prints
+{"added":[],"removed":[...],"changed":[]} with the full normalized removed records sorted by
+id; the whole catalog is validated like preview on every request, an empty selection prints
+three empty arrays without writing, deleting every record saves {}, and failures preserve
+the original file bytes and exit 2.
 python3 -B -m unittest -v
