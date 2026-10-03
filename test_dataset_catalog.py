@@ -3342,6 +3342,205 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("error", json.loads(run.stdout))
         self.assertEqual(self.path.read_text(encoding="utf-8"), catalog_before)
 
+    def test_remove_leaf_returns_normalized_record_and_keeps_upstream(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("orders"),
+            self._snapshot_record("daily_totals", ["orders"])]})
+        result = self.catalog.remove(["daily_totals"])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual([row["id"] for row in result["removed"]], ["daily_totals"])
+        self.assertEqual(result["removed"][0],
+                         self._snapshot_record("daily_totals", ["orders"]))
+        fresh = DatasetCatalog(self.path)
+        self.assertEqual([row["id"] for row in fresh.export()["datasets"]], ["orders"])
+
+    def test_remove_upstream_rejected_without_cascade_and_nothing_writes(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("orders"),
+            self._snapshot_record("daily_totals", ["orders"])]})
+        before = self.path.read_text(encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.catalog.remove(["orders"])
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+        self.assertEqual([row["id"] for row in self.catalog.export()["datasets"]],
+                         ["orders", "daily_totals"])
+
+    def test_remove_allows_explicitly_selected_downstream(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("orders"),
+            self._snapshot_record("daily_totals", ["orders"])]})
+        result = self.catalog.remove(["daily_totals", "orders"])
+        self.assertEqual([row["id"] for row in result["removed"]],
+                         ["daily_totals", "orders"])
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), {})
+
+    def test_remove_cascade_removes_reachable_downstream_once(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("orders"),
+            self._snapshot_record("daily_totals", ["orders"])]})
+        result = self.catalog.remove(["orders"], cascade=True)
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual([row["id"] for row in result["removed"]],
+                         ["daily_totals", "orders"])
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), {})
+        fresh = DatasetCatalog(self.path)
+        self.assertEqual(fresh.export(), {"datasets": []})
+        self.assertEqual(fresh.search(), [])
+
+    def test_remove_cascade_keeps_unrelated_and_upstream_records(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("base"),
+            self._snapshot_record("mid", ["base"]),
+            self._snapshot_record("left", ["mid"]),
+            self._snapshot_record("right", ["mid"]),
+            self._snapshot_record("shared", ["left", "right"]),
+            self._snapshot_record("other")]})
+        result = self.catalog.remove(["mid"], cascade=True)
+        self.assertEqual([row["id"] for row in result["removed"]],
+                         ["left", "mid", "right", "shared"])
+        remaining = [row["id"] for row in self.catalog.export()["datasets"]]
+        self.assertEqual(remaining, ["base", "other"])
+
+    def test_remove_validates_arguments_before_reading_catalog(self):
+        nested = Path(self.temp.name) / "state" / "nested" / "catalog.json"
+        catalog = DatasetCatalog(nested)
+        for identifiers in (None, "orders", {"orders"}, 1, True,
+                            ["orders", 1], ["orders", None], ["Bad Id"], [""]):
+            with self.assertRaises(ValueError):
+                catalog.remove(identifiers)
+        for cascade in (None, 0, 1, "true", []):
+            with self.assertRaises(ValueError):
+                catalog.remove([], cascade=cascade)
+        self.assertFalse(nested.exists())
+        self.assertFalse(nested.parent.exists())
+
+    def test_remove_merges_duplicates_and_does_not_mutate_input(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b")]})
+        identifiers = ["b", "a", "b"]
+        result = self.catalog.remove(identifiers)
+        self.assertEqual(identifiers, ["b", "a", "b"])
+        self.assertEqual([row["id"] for row in result["removed"]], ["a", "b"])
+        result["removed"][0]["id"] = "mutated"
+        self.assertEqual(self.catalog.export(), {"datasets": []})
+
+    def test_remove_unknown_dataset_raises_without_writing(self):
+        self.catalog.import_bundle({"datasets": [self._snapshot_record("a")]})
+        before = self.path.read_text(encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.catalog.remove(["ghost"])
+        with self.assertRaises(ValueError):
+            self.catalog.remove(["a", "ghost"], cascade=True)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_remove_empty_list_validates_catalog_and_never_writes(self):
+        nested = Path(self.temp.name) / "state" / "nested" / "catalog.json"
+        catalog = DatasetCatalog(nested)
+        self.assertEqual(catalog.remove([]), {"added": [], "removed": [], "changed": []})
+        self.assertFalse(nested.exists())
+        self.assertFalse(nested.parent.exists())
+
+        self.catalog.import_bundle({"datasets": [self._snapshot_record("a")]})
+        before = self.path.read_text(encoding="utf-8")
+        self.assertEqual(self.catalog.remove([]),
+                         {"added": [], "removed": [], "changed": []})
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+        self._write_records({"a": self._snapshot_record("a", ["ghost"])})
+        with self.assertRaises(ValueError):
+            self.catalog.remove([])
+
+    def test_remove_validates_whole_catalog_like_preview(self):
+        bad_states = [
+            json.dumps([self._snapshot_record("a")]),
+            json.dumps({"a": "x"}),
+            json.dumps({"a": self._snapshot_record("a", ["ghost"])}),
+            json.dumps({"a": self._snapshot_record("a", ["a"])}),
+            json.dumps({"a": self._snapshot_record("a", ["b", "b"]),
+                        "b": self._snapshot_record("b")}),
+            json.dumps({"a": {**self._snapshot_record("a"), "id": "other"}}),
+            json.dumps({"a": self._snapshot_record("a", ["b"]),
+                        "b": self._snapshot_record("b", ["a"])}),
+        ]
+        for index, state in enumerate(bad_states):
+            other = Path(self.temp.name) / ("bad-remove-" + str(index) + ".json")
+            other.write_text(state, encoding="utf-8")
+            with self.assertRaises(ValueError):
+                DatasetCatalog(other).remove(["a"])
+            with self.assertRaises(ValueError):
+                DatasetCatalog(other).remove(["a"], cascade=True)
+            self.assertEqual(other.read_text(encoding="utf-8"), state)
+
+    def test_remove_save_failure_raises_oserror_and_preserves_state(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"])]})
+        before = self.path.read_text(encoding="utf-8")
+        with mock.patch("dataset_catalog.os.replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                self.catalog.remove(["a", "b"])
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+        self.assertEqual([row["id"] for row in self.catalog.export()["datasets"]],
+                         ["a", "b"])
+        leftovers = [item for item in self.path.parent.iterdir() if item != self.path]
+        self.assertEqual(leftovers, [])
+
+    def test_remove_unreadable_file_and_bad_json_propagate(self):
+        self.path.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(json.JSONDecodeError):
+            self.catalog.remove(["a"])
+        self.path.write_text(json.dumps({"a": self._snapshot_record("a")}),
+                             encoding="utf-8")
+        with mock.patch("dataset_catalog.Path.read_text", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                self.catalog.remove(["a"])
+
+    def test_cli_remove(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")],
+                       check=True, capture_output=True)
+        subprocess.run(prefix + ["register", str(ROOT / "samples/daily.json")],
+                       check=True, capture_output=True)
+
+        blocked = subprocess.run(prefix + ["remove", "--id", "orders"],
+                                 capture_output=True, text=True)
+        self.assertEqual(blocked.returncode, 2)
+        self.assertEqual(set(json.loads(blocked.stdout)), {"error"})
+
+        run = subprocess.run(prefix + ["remove", "--id", "daily_totals"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual(set(result), {"added", "removed", "changed"})
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual([row["id"] for row in result["removed"]], ["daily_totals"])
+        exported = subprocess.run(prefix + ["export"], capture_output=True, text=True)
+        self.assertEqual([row["id"] for row in json.loads(exported.stdout)["datasets"]],
+                         ["orders"])
+
+        empty = subprocess.run(prefix + ["remove"], capture_output=True, text=True)
+        self.assertEqual(empty.returncode, 0, empty.stderr)
+        self.assertEqual(json.loads(empty.stdout),
+                         {"added": [], "removed": [], "changed": []})
+
+        run = subprocess.run(prefix + ["remove", "--id", "orders", "--cascade"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual([row["id"] for row in json.loads(run.stdout)["removed"]],
+                         ["orders"])
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), {})
+
+        unknown = subprocess.run(prefix + ["remove", "--id", "ghost"],
+                                 capture_output=True, text=True)
+        self.assertEqual(unknown.returncode, 2)
+        self.assertEqual(set(json.loads(unknown.stdout)), {"error"})
+        invalid = subprocess.run(prefix + ["remove", "--id", "Bad Id"],
+                                 capture_output=True, text=True)
+        self.assertEqual(invalid.returncode, 2)
+        self.assertEqual(set(json.loads(invalid.stdout)), {"error"})
+
 
 class ExportCsvTests(unittest.TestCase):
     HEADER = "dataset_id,description,owner,tags,depends_on,field_name,field_type\n"

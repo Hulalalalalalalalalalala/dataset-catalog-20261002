@@ -846,6 +846,54 @@ class DatasetCatalog:
         return {"bundle": bundle, "diff": self._diff_states(current, merged),
                 "conflicts": []}
 
+    def remove(self, identifiers, cascade=False):
+        if not isinstance(identifiers, list):
+            raise ValueError("identifiers must be a list of dataset ids")
+        if not isinstance(cascade, bool):
+            raise ValueError("cascade must be a boolean")
+        selected = []
+        for item in identifiers:
+            if not isinstance(item, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", item):
+                raise ValueError("invalid dataset id")
+            if item not in selected:
+                selected.append(item)
+        current = self._current_state()
+        if any(item not in current for item in selected):
+            raise ValueError("unknown dataset")
+        if not selected:
+            return {"added": [], "removed": [], "changed": []}
+        downstream = _downstream_index(current)
+        if cascade:
+            delete = set()
+            stack = list(selected)
+            while stack:
+                key = stack.pop()
+                if key in delete:
+                    continue
+                delete.add(key)
+                stack.extend(downstream.get(key, ()))
+        else:
+            delete = set(selected)
+            # removing a record is rejected while anything outside the delete set
+            # still reaches it downstream, directly or transitively
+            for key in delete:
+                reached = set()
+                stack = [key]
+                while stack:
+                    node = stack.pop()
+                    for child in downstream.get(node, ()):
+                        if child not in reached:
+                            reached.add(child)
+                            stack.append(child)
+                if reached - delete:
+                    raise ValueError("dataset has downstream dependents outside the selection")
+        remaining = {key: entry for key, entry in current.items() if key not in delete}
+        diff = self._diff_states(current, remaining)
+        if diff["removed"]:
+            ordered = _toposort(remaining)
+            self._save_records({key: remaining[key] for key in ordered})
+        return diff
+
     def apply_bundle(self, bundle, expected_bundle=None):
         snapshot = self._snapshot_state(bundle)
         expected = None if expected_bundle is None else self._snapshot_state(expected_bundle)
@@ -902,6 +950,12 @@ def main():
              "or the conflicting records")
     reconcile_cmd.add_argument("base")
     reconcile_cmd.add_argument("incoming")
+    remove_cmd = commands.add_parser(
+        "remove",
+        help="remove the datasets named by repeated --id options; with --cascade also "
+             "remove every dataset reachable downstream of them")
+    remove_cmd.add_argument("--id", action="append", dest="ids")
+    remove_cmd.add_argument("--cascade", action="store_true")
     commands.add_parser("describe").add_argument("id")
     commands.add_parser("dependencies").add_argument("id")
     impact = commands.add_parser("impact")
@@ -965,6 +1019,8 @@ def main():
                 result = catalog.apply_bundle(bundle, expected)
         elif args.command == "merge":
             result = catalog.merge_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
+        elif args.command == "remove":
+            result = catalog.remove([] if args.ids is None else args.ids, cascade=args.cascade)
         elif args.command == "reconcile":
             base = json.loads(Path(args.base).read_text(encoding="utf-8"))
             incoming = json.loads(Path(args.incoming).read_text(encoding="utf-8"))

@@ -84,6 +84,18 @@ depends_on stores []), unlisted records are kept and nothing is deleted. Prints 
 {"added":[...],"removed":[...],"changed":[...]} diff as diff (removed always empty); an empty
 or no-change batch prints three empty arrays without writing. The whole current catalog and
 the merged dependency graph are validated before the atomic commit; errors exit 2.
+python3 dataset_catalog.py remove --id orders --cascade
+Removes the datasets named by repeated --id options (duplicates merge, order irrelevant,
+omitting --id means an empty selection) and prints the same
+{"added":[...],"removed":[...],"changed":[...]} diff as apply, with added and changed always
+empty and removed holding the full normalized records sorted by id. Without --cascade only the
+selected records are removed, and the whole request is rejected while anything outside the
+selection still depends on a removed record directly or transitively; --cascade also removes
+every dataset reachable downstream of the selection (shared downstream once) while upstream
+and unrelated records stay. Removing everything saves {}; an empty selection prints three
+empty arrays without writing. Argument formats are validated before the catalog is read, an
+unregistered id errors, the whole current catalog is validated like preview even outside the
+delete set, and the commit is all-or-nothing; errors exit 2.
 python3 dataset_catalog.py reconcile BASE INCOMING
 Previews a read-only three-way reconcile of two complete {"datasets":[...]} snapshot files
 against the current catalog: records equal to the base take the incoming version, records
