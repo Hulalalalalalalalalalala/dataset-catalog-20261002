@@ -10,7 +10,14 @@ Smoke Test
 python3 dataset_catalog.py dependencies daily_totals
 Returns orders as the only direct dependency.
 python3 dataset_catalog.py impact orders
-Returns daily_totals at distance 1 with path ["orders","daily_totals"].
+Returns daily_totals at distance 1 with path ["orders","daily_totals"]. Direct and indirect
+downstream, sorted by distance then id, each downstream once with dataset/distance/path only and
+the describe record; ties choose the lexicographically smallest shortest id sequence, start never
+listed, a leaf returns []. The whole catalog is validated before any result (non-object top level,
+invalid descriptor, key/id mismatch, duplicate or missing dependency, self dependency or cycle —
+even beyond --max-depth or unrelated to the start), args validated before the catalog is read
+(invalid id, unknown start, bad depth), missing/{} catalog is empty, unreadable file is OSError,
+bad JSON a decode error; --max-depth only limits displayed distance; read-only, errors exit 2.
 python3 dataset_catalog.py upstream daily_totals
 Returns orders at distance 1 with path ["daily_totals","orders"]; direct and indirect upstream,
 sorted by distance then id, with --max-depth limiting the shortest distance; read-only, errors exit 2.

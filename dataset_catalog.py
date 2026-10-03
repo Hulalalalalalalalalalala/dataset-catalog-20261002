@@ -250,16 +250,20 @@ class DatasetCatalog:
         return [self.describe(key) for key in entry["depends_on"]]
 
     def impact(self, identifier, max_depth=None):
+        if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
+            raise ValueError("invalid dataset id")
         if max_depth is not None and (isinstance(max_depth, bool)
                                       or not isinstance(max_depth, int) or max_depth <= 0):
             raise ValueError("max_depth must be None or a positive integer")
         records = self.entries()
+        if not isinstance(records, dict):
+            raise ValueError("invalid catalog state")
         if identifier not in records:
             raise ValueError("unknown dataset")
-        downstream = {}
-        for key, entry in records.items():
-            for source in entry["depends_on"]:
-                downstream.setdefault(source, set()).add(key)
+        # the whole catalog is normalized and graph-validated before any result is
+        # produced, so a cycle or invalid record anywhere fails even an empty impact
+        current = self._current_state()
+        downstream = _downstream_index(current)
         reached = {identifier: [identifier]}
         frontier = {identifier: [identifier]}
         result = []

@@ -77,6 +77,93 @@ class CatalogTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.catalog.impact("missing")
 
+    def test_impact_validates_arguments_before_reading_catalog(self):
+        self.assertFalse(self.path.exists())
+        missing = DatasetCatalog(self.path)
+        for bad in (1, None, True, "", "Orders", "ord ers", "ordérs"):
+            with self.assertRaises(ValueError):
+                missing.impact(bad)
+        for bad in (True, False, 0, -1, 1.0, "1"):
+            with self.assertRaises(ValueError):
+                missing.impact("orders", bad)
+        self.assertFalse(self.path.exists())
+        # a well-formed but unregistered start in a missing/empty catalog is unknown
+        with self.assertRaises(ValueError):
+            missing.impact("orders")
+        self.assertFalse(self.path.exists())
+        self.path.write_text("{}", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            DatasetCatalog(self.path).impact("orders")
+
+    def test_impact_validates_the_whole_catalog_even_when_unreachable(self):
+        good = {"s": self._record("s", []), "t": self._record("t", ["s"])}
+        bad_states = (
+            ["not", "an", "object"],
+            {**good, "other": {"id": "else", "fields": [{"name": "n", "type": "integer"}]}},
+            {**good, "other": "not a descriptor"},
+            {**good, "other": {"id": "other",
+                               "fields": [{"name": "n", "type": "integer"}],
+                               "depends_on": ["ghost"]}},
+            {**good, "other": {"id": "other",
+                               "fields": [{"name": "n", "type": "integer"}],
+                               "depends_on": ["other", "other"]}},
+            {**good, "other": {"id": "other",
+                               "fields": [{"name": "n", "type": "integer"}],
+                               "depends_on": ["other"]}},
+        )
+        for state in bad_states:
+            self._write_records(state)
+            with self.assertRaises(ValueError):
+                self.catalog.impact("s")
+        # a cycle anywhere, including records with no path from the start, fails
+        self._write_records({**good,
+                             "a": self._record("a", ["b"]), "b": self._record("b", ["a"])})
+        with self.assertRaises(ValueError):
+            self.catalog.impact("s")
+        # validation failure in an unrelated record still errors on an empty result
+        self._write_records({**good, "other": "not a descriptor"})
+        with self.assertRaises(ValueError):
+            self.catalog.impact("t")
+
+    def test_impact_depth_limit_never_hides_validation_errors(self):
+        self._write_records({
+            "s": self._record("s", []), "a": self._record("a", ["s"]),
+            "b": self._record("b", ["a"]),
+            "far": {"id": "far", "fields": [{"name": "n", "type": "integer"}],
+                    "depends_on": ["ghost"]}})
+        with self.assertRaises(ValueError):
+            self.catalog.impact("s", 1)
+        self._write_records({
+            "s": self._record("s", []), "a": self._record("a", ["s"]),
+            "b": self._record("b", ["a"]),
+            "x": self._record("x", []), "y": self._record("y", ["x"])})
+        self.path.write_text(json.dumps({
+            "s": self._record("s", []), "a": self._record("a", ["s"]),
+            "b": self._record("b", ["a"]),
+            "x": self._record("x", ["y"]), "y": self._record("y", ["x"])}),
+            encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.catalog.impact("s", 1)
+
+    def test_impact_unreadable_file_raises_oserror_and_bad_json_raises_decode_error(self):
+        with self.assertRaises(OSError):
+            DatasetCatalog(Path(self.temp.name)).impact("orders")
+        self.path.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(json.JSONDecodeError):
+            self.catalog.impact("orders")
+
+    def test_impact_is_read_only_and_returns_describe_records(self):
+        self._write_records({
+            "s": self._record("s", []), "a": self._record("a", ["s"]),
+            "lone": self._record("lone", [])})
+        before = self.path.read_text(encoding="utf-8")
+        self.assertEqual(self.catalog.impact("lone"), [])
+        result = self.catalog.impact("s")
+        self.assertEqual(result[0]["dataset"], self.catalog.describe("a"))
+        self.assertEqual(set(result[0]), {"dataset", "distance", "path"})
+        self.catalog.impact("s", 1)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
     def test_cli_impact(self):
         prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
         subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")], check=True, capture_output=True)
@@ -95,6 +182,19 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("error", json.loads(depth_error.stdout))
         self.assertEqual(subprocess.run(prefix + ["impact", "missing"],
                                         capture_output=True).returncode, 2)
+        cyclic = Path(self.temp.name) / "cyclic.json"
+        cyclic.write_text(json.dumps({
+            "a": self._record("a", ["b"]), "b": self._record("b", ["a"])}), encoding="utf-8")
+        cycle_run = subprocess.run(
+            [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(cyclic),
+             "impact", "a"], capture_output=True, text=True)
+        self.assertEqual(cycle_run.returncode, 2)
+        self.assertIn("error", json.loads(cycle_run.stdout))
+        bad_json = Path(self.temp.name) / "bad.json"
+        bad_json.write_text("{not json", encoding="utf-8")
+        self.assertEqual(subprocess.run(
+            [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(bad_json),
+             "impact", "orders"], capture_output=True, text=True).returncode, 2)
 
     def test_upstream_lists_direct_and_indirect_with_shortest_paths(self):
         for identifier, depends_on in (("orders", []), ("daily", ["orders"]),
