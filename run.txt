@@ -106,4 +106,19 @@ indirectly on a selected one; edges are never rewritten. Prints
 id; the whole catalog is validated like preview on every request, an empty selection prints
 three empty arrays without writing, deleting every record saves {}, and failures preserve
 the original file bytes and exit 2.
+python3 dataset_catalog.py rename orders sales_orders
+Renames one registered dataset from OLD id to NEW id in the --catalog: the catalog key and
+record id change, every depends_on reference to OLD is replaced by NEW (lists stay id-sorted),
+and description, fields and order, owner, tags and the default owner/tags absence are kept,
+while OLD inside free text is never replaced. Prints the same
+{"added":[...],"removed":[...],"changed":[...]} diff (added only the NEW record, removed only
+the OLD record, changed only records whose reference was rewritten, with before/after and
+changed_keys); renaming the sample orders makes daily_totals depend on sales_orders and new-id
+queries and exports reflect it immediately. Both ids must match the id rule before the catalog
+is read, OLD must be registered and a different NEW must not be occupied; identical registered
+ids return three empty arrays and write nothing. The whole catalog is validated like preview
+(even unrelated records and same-id requests); missing file or {} is empty, OSError and
+JSONDecodeError propagate, the atomic commit preserves original bytes on failure and never
+creates a missing file or directories, and only metadata is touched. Success exits 0; failure
+prints JSON containing only error and exits 2.
 python3 -B -m unittest -v

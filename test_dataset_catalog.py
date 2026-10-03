@@ -3808,5 +3808,293 @@ class RemoveTests(unittest.TestCase):
         self.assertEqual(set(json.loads(bad_id.stdout)), {"error"})
 
 
+class RenameTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "catalog.json"
+        self.catalog = DatasetCatalog(self.path)
+
+    def _register(self, identifier, depends_on=None, **extra):
+        descriptor = {"id": identifier,
+                      "fields": [{"name": "n", "type": "integer"}],
+                      "depends_on": depends_on or []}
+        descriptor.update(extra)
+        self.catalog.register(descriptor)
+
+    def _sample_catalog(self):
+        subprocess.run([sys.executable, str(ROOT / "dataset_catalog.py"),
+                        "--catalog", str(self.path), "register",
+                        str(ROOT / "samples/orders.json")],
+                       check=True, capture_output=True)
+        subprocess.run([sys.executable, str(ROOT / "dataset_catalog.py"),
+                        "--catalog", str(self.path), "register",
+                        str(ROOT / "samples/daily.json")],
+                       check=True, capture_output=True)
+
+    def test_rename_sample_orders_to_sales_orders_diff_shape(self):
+        self._sample_catalog()
+        before_orders = self.catalog.describe("orders")
+        before_daily = self.catalog.describe("daily_totals")
+        result = self.catalog.rename("orders", "sales_orders")
+        self.assertEqual([row["id"] for row in result["added"]], ["sales_orders"])
+        added = result["added"][0]
+        self.assertEqual(added["id"], "sales_orders")
+        self.assertEqual(added["description"], before_orders["description"])
+        self.assertEqual(added["fields"], before_orders["fields"])
+        self.assertEqual(added["depends_on"], [])
+        self.assertEqual(set(added), set(before_orders))
+        self.assertEqual([row["id"] for row in result["removed"]], ["orders"])
+        self.assertEqual(result["removed"][0], before_orders)
+        self.assertEqual([row["id"] for row in result["changed"]], ["daily_totals"])
+        changed = result["changed"][0]
+        self.assertEqual(changed["before"], before_daily)
+        self.assertEqual(changed["after"]["id"], "daily_totals")
+        self.assertEqual(changed["after"]["depends_on"], ["sales_orders"])
+        self.assertEqual(changed["after"]["description"], before_daily["description"])
+        self.assertEqual(changed["after"]["fields"], before_daily["fields"])
+        self.assertEqual(changed["changed_keys"], ["depends_on"])
+
+    def test_rename_persists_new_key_and_rewrites_references(self):
+        self._sample_catalog()
+        self.catalog.rename("orders", "sales_orders")
+        records = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(set(records), {"sales_orders", "daily_totals"})
+        self.assertEqual(records["sales_orders"]["id"], "sales_orders")
+        self.assertEqual(records["daily_totals"]["depends_on"], ["sales_orders"])
+        # the old id survives inside free text but no longer exists as a record
+        self.assertEqual(records["daily_totals"]["description"],
+                         "Daily totals derived from orders")
+        self.assertNotIn("orders", records)
+
+    def test_rename_is_visible_immediately_to_queries_and_exports(self):
+        self._sample_catalog()
+        self.catalog.rename("orders", "sales_orders")
+        fresh = DatasetCatalog(self.path)
+        self.assertEqual(fresh.describe("sales_orders")["id"], "sales_orders")
+        self.assertEqual([row["id"] for row in fresh.dependencies("daily_totals")],
+                         ["sales_orders"])
+        with self.assertRaises(ValueError):
+            fresh.describe("orders")
+        impact = fresh.impact("sales_orders")
+        self.assertEqual([(row["dataset"]["id"], row["distance"], row["path"])
+                          for row in impact],
+                         [("daily_totals", 1, ["sales_orders", "daily_totals"])])
+        self.assertEqual(fresh.upstream("daily_totals")[0]["path"],
+                         ["daily_totals", "sales_orders"])
+        chain = fresh.between("sales_orders", "daily_totals")
+        self.assertEqual([row["id"] for row in chain["datasets"]],
+                         ["daily_totals", "sales_orders"])
+        self.assertEqual(chain["edges"],
+                         [{"source": "sales_orders", "target": "daily_totals"}])
+        self.assertEqual([row["id"] for row in fresh.export()["datasets"]],
+                         ["sales_orders", "daily_totals"])
+
+    def test_rename_keeps_fields_order_description_owner_tags_and_default_state(self):
+        self.catalog.register({"id": "orders",
+                               "description": "orders feed with orders in text",
+                               "fields": [{"name": "zebra", "type": "integer"},
+                                          {"name": "amount", "type": "number"}],
+                               "tags": [" Ops ", "Fin"], "owner": " Team "})
+        self.catalog.register({"id": "daily",
+                               "description": "orders",
+                               "fields": [{"name": "n", "type": "integer"}],
+                               "depends_on": ["orders"]})
+        result = self.catalog.rename("orders", "sales_orders")
+        added = result["added"][0]
+        self.assertEqual(added["description"], "orders feed with orders in text")
+        self.assertEqual([field["name"] for field in added["fields"]],
+                         ["zebra", "amount"])
+        self.assertEqual(added["tags"], ["Ops", "Fin"])
+        self.assertEqual(added["owner"], "Team")
+        daily = self.catalog.describe("daily")
+        self.assertEqual(daily["depends_on"], ["sales_orders"])
+        self.assertEqual(daily["description"], "orders")  # text is not rewritten
+
+    def test_rename_without_tags_or_owner_keeps_default_state(self):
+        self._sample_catalog()
+        self.catalog.rename("orders", "sales_orders")
+        added_entry = json.loads(self.path.read_text(encoding="utf-8"))["sales_orders"]
+        self.assertNotIn("tags", added_entry)
+        self.assertNotIn("owner", added_entry)
+
+    def test_rename_leaf_has_no_changed_records(self):
+        self._register("orders")
+        self._register("daily", ["orders"])
+        result = self.catalog.rename("daily", "daily_v2")
+        self.assertEqual([row["id"] for row in result["added"]], ["daily_v2"])
+        self.assertEqual([row["id"] for row in result["removed"]], ["daily"])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(self.catalog.describe("orders")["depends_on"], [])
+
+    def test_rename_replaces_every_reference_and_keeps_dependencies_sorted(self):
+        self._register("aaa")
+        self._register("zzz")
+        self._register("orders", ["zzz", "aaa"])
+        self._register("mid", ["orders"])
+        self._register("other", ["orders", "aaa"])
+        result = self.catalog.rename("orders", "mmm")
+        changed_ids = [row["id"] for row in result["changed"]]
+        self.assertEqual(changed_ids, ["mid", "other"])
+        saved = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["mmm"]["depends_on"], ["aaa", "zzz"])
+        self.assertEqual(saved["mid"]["depends_on"], ["mmm"])
+        self.assertEqual(saved["other"]["depends_on"], ["aaa", "mmm"])
+        for row in result["changed"]:
+            self.assertEqual(row["changed_keys"], ["depends_on"])
+
+    def test_rename_same_id_registered_is_a_validating_noop_without_writing(self):
+        self._sample_catalog()
+        before = self.path.read_bytes()
+        self.assertEqual(self.catalog.rename("orders", "orders"),
+                         {"added": [], "removed": [], "changed": []})
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_rename_validates_argument_formats_before_reading_catalog(self):
+        self.path.write_text("{not json", encoding="utf-8")
+        for bad in (None, 1, True, "", "Bad", " orders", "1x", ["orders"]):
+            with self.assertRaises(ValueError):
+                self.catalog.rename(bad, "new_id")
+            with self.assertRaises(ValueError):
+                self.catalog.rename("orders", bad)
+        # the malformed catalog is never read, so no JSONDecodeError escapes
+        self.assertEqual(self.path.read_text(encoding="utf-8"), "{not json")
+
+    def test_rename_unknown_old_id_and_occupied_new_id(self):
+        self._sample_catalog()
+        before = self.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.catalog.rename("missing", "new_id")
+        with self.assertRaises(ValueError):
+            self.catalog.rename("orders", "daily_totals")
+        self.assertEqual(self.path.read_bytes(), before)
+        missing_file = DatasetCatalog(Path(self.temp.name) / "sub" / "catalog.json")
+        with self.assertRaises(ValueError):
+            missing_file.rename("orders", "sales_orders")
+        self.assertFalse((Path(self.temp.name) / "sub").exists())
+
+    def test_rename_validates_whole_catalog_including_unrelated_and_same_name(self):
+        self._register("orders")
+        self._register("daily", ["orders"])
+        records = json.loads(self.path.read_text(encoding="utf-8"))
+        records["broken"] = {"id": "broken",
+                             "fields": [{"name": "x", "type": "integer"}],
+                             "depends_on": ["missing"]}
+        self.path.write_text(json.dumps(records), encoding="utf-8")
+        before = self.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.catalog.rename("orders", "sales_orders")
+        with self.assertRaises(ValueError):
+            self.catalog.rename("orders", "orders")
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_rename_rejects_invalid_graph_states_even_when_unrelated(self):
+        self._register("orders")
+        self._register("daily", ["orders"])
+        cases = [
+            ["not", "an", "object"],
+            {"orders": {"id": "different",
+                        "fields": [{"name": "n", "type": "integer"}],
+                        "depends_on": []}},
+            {"orders": {"id": "orders",
+                        "fields": [{"name": "n", "type": "integer"}],
+                        "depends_on": ["orders"]}},
+        ]
+        for payload in cases:
+            self.path.write_text(json.dumps(payload), encoding="utf-8")
+            before = self.path.read_bytes()
+            with self.assertRaises(ValueError):
+                self.catalog.rename("daily", "renamed_daily")
+            self.assertEqual(self.path.read_bytes(), before)
+
+    def test_rename_validates_catalog_when_file_missing_or_empty(self):
+        # missing file: empty catalog, so the old id is unknown and nothing is created
+        missing = DatasetCatalog(Path(self.temp.name) / "sub" / "catalog.json")
+        with self.assertRaises(ValueError):
+            missing.rename("orders", "orders")
+        with self.assertRaises(ValueError):
+            missing.rename("orders", "sales_orders")
+        self.assertFalse((Path(self.temp.name) / "sub").exists())
+        # {} is an empty catalog too
+        self.path.write_text("{}", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.catalog.rename("orders", "orders")
+
+    def test_rename_bad_json_and_unreadable_file(self):
+        self.path.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(json.JSONDecodeError):
+            self.catalog.rename("orders", "sales_orders")
+        with self.assertRaises(OSError):
+            DatasetCatalog(self.temp.name).rename("orders", "sales_orders")
+
+    def test_rename_save_failure_preserves_original_bytes(self):
+        self._sample_catalog()
+        before = self.path.read_bytes()
+        with mock.patch("dataset_catalog.os.replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                self.catalog.rename("orders", "sales_orders")
+        self.assertEqual(self.path.read_bytes(), before)
+        # catalog still answers under the old ids after the failed save
+        self.assertEqual(self.catalog.describe("orders")["id"], "orders")
+        self.assertEqual(self.catalog.describe("daily_totals")["depends_on"], ["orders"])
+
+    def test_rename_returns_independent_copies(self):
+        self._sample_catalog()
+        result = self.catalog.rename("orders", "sales_orders")
+        result["added"][0]["description"] = "tampered"
+        result["removed"][0]["fields"].append({"name": "x", "type": "string"})
+        result["changed"][0]["after"]["depends_on"].append("orders")
+        self.assertEqual(self.catalog.describe("sales_orders")["description"],
+                         "Order amounts from the daily export")
+        self.assertEqual(self.catalog.describe("daily_totals")["depends_on"],
+                         ["sales_orders"])
+
+    def test_cli_rename(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"),
+                  "--catalog", str(self.path)]
+        self._sample_catalog()
+        run = subprocess.run(prefix + ["rename", "orders", "sales_orders"],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        payload = json.loads(run.stdout)
+        self.assertEqual(set(payload), {"added", "removed", "changed"})
+        self.assertEqual([row["id"] for row in payload["added"]], ["sales_orders"])
+        self.assertEqual([row["id"] for row in payload["removed"]], ["orders"])
+        changed = payload["changed"]
+        self.assertEqual([row["id"] for row in changed], ["daily_totals"])
+        self.assertEqual(changed[0]["after"]["depends_on"], ["sales_orders"])
+        self.assertEqual(changed[0]["changed_keys"], ["depends_on"])
+        describe = subprocess.run(prefix + ["describe", "sales_orders"],
+                                  capture_output=True, text=True)
+        self.assertEqual(describe.returncode, 0, describe.stderr)
+        self.assertEqual(json.loads(describe.stdout)["id"], "sales_orders")
+        dependencies = subprocess.run(prefix + ["dependencies", "daily_totals"],
+                                      capture_output=True, text=True)
+        self.assertEqual([row["id"] for row in json.loads(dependencies.stdout)],
+                         ["sales_orders"])
+        export = subprocess.run(prefix + ["export"], capture_output=True, text=True)
+        self.assertEqual([row["id"] for row in json.loads(export.stdout)["datasets"]],
+                         ["sales_orders", "daily_totals"])
+
+    def test_cli_rename_same_id_success_and_failures_exit_2(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"),
+                  "--catalog", str(self.path)]
+        self._sample_catalog()
+        before = self.path.read_bytes()
+        same = subprocess.run(prefix + ["rename", "orders", "orders"],
+                              capture_output=True, text=True)
+        self.assertEqual(same.returncode, 0, same.stderr)
+        self.assertEqual(json.loads(same.stdout),
+                         {"added": [], "changed": [], "removed": []})
+        self.assertEqual(self.path.read_bytes(), before)
+        for args in (["rename", "Bad", "good"],
+                     ["rename", "orders", "daily_totals"],
+                     ["rename", "missing", "new_id"]):
+            failed = subprocess.run(prefix + args, capture_output=True, text=True)
+            self.assertEqual(failed.returncode, 2, args)
+            self.assertEqual(set(json.loads(failed.stdout)), {"error"})
+            self.assertEqual(self.path.read_bytes(), before)
+
+
 if __name__ == "__main__":
     unittest.main()

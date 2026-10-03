@@ -893,6 +893,35 @@ class DatasetCatalog:
             self._save_records({key: remaining[key] for key in ordered})
         return diff
 
+    def rename(self, old_id, new_id):
+        for identifier in (old_id, new_id):
+            if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
+                raise ValueError("invalid dataset id")
+        current = self._current_state()
+        if old_id not in current:
+            raise ValueError("unknown dataset")
+        if new_id != old_id and new_id in current:
+            raise ValueError("dataset already registered")
+        if new_id == old_id:
+            return {"added": [], "removed": [], "changed": []}
+        renamed = {}
+        for key, entry in current.items():
+            updated = copy.deepcopy(entry)
+            if key == old_id:
+                updated["id"] = new_id
+                key = new_id
+            # only depends_on references are rewritten; descriptions and other
+            # text keep the old id verbatim, and the list stays sorted by id
+            updated["depends_on"] = sorted(new_id if dep == old_id else dep
+                                           for dep in updated["depends_on"])
+            renamed[key] = updated
+        ordered = _toposort(renamed)
+        if ordered is None:
+            raise ValueError("dependency cycle detected")
+        diff = self._diff_states(current, renamed)
+        self._save_records({key: renamed[key] for key in ordered})
+        return diff
+
 
 def _parse_max_depth(raw):
     if raw is None:
@@ -937,6 +966,12 @@ def main():
              "rejected while any unselected dataset still depends on a selected one")
     remove_cmd.add_argument("--id", action="append", dest="ids")
     remove_cmd.add_argument("--cascade", action="store_true")
+    rename_cmd = commands.add_parser(
+        "rename",
+        help="rename a single dataset from OLD id to NEW id, rewriting every "
+             "depends_on reference while leaving descriptions and other text untouched")
+    rename_cmd.add_argument("old_id", metavar="OLD")
+    rename_cmd.add_argument("new_id", metavar="NEW")
     reconcile_cmd = commands.add_parser(
         "reconcile",
         help="preview a read-only three-way reconcile of the BASE and INCOMING snapshot "
@@ -1009,6 +1044,8 @@ def main():
             result = catalog.merge_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "remove":
             result = catalog.remove([] if args.ids is None else args.ids, cascade=args.cascade)
+        elif args.command == "rename":
+            result = catalog.rename(args.old_id, args.new_id)
         elif args.command == "reconcile":
             base = json.loads(Path(args.base).read_text(encoding="utf-8"))
             incoming = json.loads(Path(args.incoming).read_text(encoding="utf-8"))
