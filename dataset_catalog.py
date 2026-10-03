@@ -894,6 +894,34 @@ class DatasetCatalog:
         return diff
 
 
+    def rename(self, old_id, new_id):
+        for identifier in (old_id, new_id):
+            if not isinstance(identifier, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", identifier):
+                raise ValueError("invalid dataset id")
+        current = self._current_state()
+        if old_id not in current:
+            raise ValueError("unknown dataset")
+        if new_id != old_id and new_id in current:
+            raise ValueError("dataset already registered")
+        renamed = {}
+        for key, entry in current.items():
+            if key == old_id:
+                continue
+            updated = copy.deepcopy(entry)
+            if old_id in updated["depends_on"]:
+                updated["depends_on"] = sorted(new_id if source == old_id else source
+                                               for source in updated["depends_on"])
+            renamed[key] = updated
+        entry = copy.deepcopy(current[old_id])
+        entry["id"] = new_id
+        renamed[new_id] = entry
+        diff = self._diff_states(current, renamed)
+        if diff["added"] or diff["removed"] or diff["changed"]:
+            ordered = _toposort(renamed)
+            self._save_records({key: renamed[key] for key in ordered})
+        return diff
+
+
 def _parse_max_depth(raw):
     if raw is None:
         return None
@@ -937,6 +965,12 @@ def main():
              "rejected while any unselected dataset still depends on a selected one")
     remove_cmd.add_argument("--id", action="append", dest="ids")
     remove_cmd.add_argument("--cascade", action="store_true")
+    rename_cmd = commands.add_parser(
+        "rename",
+        help="rename the dataset OLD to NEW, replacing every depends_on reference to the "
+             "old id while keeping the rest of each record unchanged")
+    rename_cmd.add_argument("old")
+    rename_cmd.add_argument("new")
     reconcile_cmd = commands.add_parser(
         "reconcile",
         help="preview a read-only three-way reconcile of the BASE and INCOMING snapshot "
@@ -1009,6 +1043,8 @@ def main():
             result = catalog.merge_bundle(json.loads(Path(args.file).read_text(encoding="utf-8")))
         elif args.command == "remove":
             result = catalog.remove([] if args.ids is None else args.ids, cascade=args.cascade)
+        elif args.command == "rename":
+            result = catalog.rename(args.old, args.new)
         elif args.command == "reconcile":
             base = json.loads(Path(args.base).read_text(encoding="utf-8"))
             incoming = json.loads(Path(args.incoming).read_text(encoding="utf-8"))
