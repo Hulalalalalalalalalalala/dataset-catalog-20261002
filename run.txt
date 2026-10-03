@@ -70,4 +70,11 @@ new ids added, absent records removed) and prints the pre-commit
 {"added":[...],"removed":[...],"changed":[...]} diff; all-or-nothing, errors exit 2.
 Pass --expected FILE to require the current catalog to match that expected snapshot first;
 a mismatch prints {"error":"catalog does not match expected snapshot"} and exits 2.
+python3 dataset_catalog.py merge FILE
+Incrementally merges a {"datasets":[...]} bundle file into the catalog: listed datasets are
+added or fully replace the same-id record (omitting owner/tags removes them, omitting
+depends_on stores []), unlisted records are kept and nothing is deleted. Prints the same
+{"added":[...],"removed":[...],"changed":[...]} diff as diff (removed always empty); an empty
+or no-change batch prints three empty arrays without writing. The whole current catalog and
+the merged dependency graph are validated before the atomic commit; errors exit 2.
 python3 -B -m unittest -v

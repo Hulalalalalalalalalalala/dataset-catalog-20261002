@@ -2035,6 +2035,249 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("error", json.loads(missing.stdout))
         self.assertEqual(self.path.read_text(encoding="utf-8"), before)
 
+    def test_merge_adds_and_replaces_keeping_unlisted_records(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b"),
+            self._snapshot_record("c", ["b"])]})
+        bundle = {"datasets": [
+            self._snapshot_record("c", ["b"], description="updated"),
+            self._snapshot_record("d", ["c"])]}
+        result = self.catalog.merge_bundle(bundle)
+        self.assertEqual(set(result), {"added", "removed", "changed"})
+        self.assertEqual([row["id"] for row in result["added"]], ["d"])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual([row["id"] for row in result["changed"]], ["c"])
+        self.assertEqual(result["changed"][0]["changed_keys"], ["description"])
+        self.assertEqual(result["changed"][0]["before"],
+                         self._snapshot_record("c", ["b"]))
+        fresh = DatasetCatalog(self.path)
+        self.assertEqual([row["id"] for row in fresh.export()["datasets"]],
+                         ["a", "b", "c", "d"])
+        self.assertEqual(fresh.describe("c")["description"], "updated")
+        self.assertEqual(self.catalog.merge_bundle(bundle),
+                         {"added": [], "removed": [], "changed": []})
+
+    def test_merge_replacement_drops_omitted_owner_tags_and_dependencies(self):
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"),
+            {**self._snapshot_record("b", ["a"], tags=["x", "y"]), "owner": "Team A"}]})
+        result = self.catalog.merge_bundle({"datasets": [self._snapshot_record("b")]})
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual([row["id"] for row in result["changed"]], ["b"])
+        self.assertEqual(result["changed"][0]["changed_keys"],
+                         ["depends_on", "owner", "tags"])
+        fresh = DatasetCatalog(self.path)
+        self.assertEqual(fresh.describe("b"), self._snapshot_record("b"))
+        self.assertEqual(fresh.describe("a"), self._snapshot_record("a"))
+
+    def test_merge_keeps_dependents_and_rejects_new_cycles(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")],
+                       check=True, capture_output=True)
+        subprocess.run(prefix + ["register", str(ROOT / "samples/daily.json")],
+                       check=True, capture_output=True)
+        replaced = {"id": "orders", "description": "replaced",
+                    "fields": [{"name": "amount", "type": "number"}]}
+        result = self.catalog.merge_bundle({"datasets": [replaced]})
+        self.assertEqual([row["id"] for row in result["changed"]], ["orders"])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(result["removed"], [])
+        daily = self.catalog.describe("daily_totals")
+        self.assertEqual(daily["depends_on"], ["orders"])
+        self.assertEqual(self.catalog.describe("orders")["description"], "replaced")
+
+        before = self.path.read_text(encoding="utf-8")
+        cycle = {"datasets": [
+            {**replaced, "depends_on": ["daily_totals"]},
+            self._snapshot_record("new")]}
+        with self.assertRaises(ValueError):
+            self.catalog.merge_bundle(cycle)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+        with self.assertRaises(ValueError):
+            self.catalog.describe("new")
+
+    def test_merge_allows_forward_references_and_ignores_batch_order(self):
+        bundle = {"datasets": [
+            self._snapshot_record("c", ["b", "a"]),
+            self._snapshot_record("b", ["a"]),
+            self._snapshot_record("a")], "ignored": 1}
+        result = self.catalog.merge_bundle(bundle)
+        self.assertEqual([row["id"] for row in result["added"]], ["a", "b", "c"])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual(result["changed"], [])
+        self.assertEqual([row["id"] for row in self.catalog.export()["datasets"]],
+                         ["a", "b", "c"])
+        self.assertEqual(self.catalog.describe("c")["depends_on"], ["a", "b"])
+
+    def test_merge_empty_or_unchanged_batch_never_writes_or_creates_dirs(self):
+        nested = Path(self.temp.name) / "state" / "nested" / "catalog.json"
+        empty_catalog = DatasetCatalog(nested)
+        for bundle in ({"datasets": []}, {"datasets": [], "other": 1}):
+            self.assertEqual(empty_catalog.merge_bundle(bundle),
+                             {"added": [], "removed": [], "changed": []})
+        self.assertFalse(nested.exists())
+        self.assertFalse(nested.parent.exists())
+
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"])]})
+        before = self.path.read_text(encoding="utf-8")
+        result = self.catalog.merge_bundle({"datasets": [
+            self._snapshot_record("b", ["a"]), self._snapshot_record("a")]})
+        self.assertEqual(result, {"added": [], "removed": [], "changed": []})
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_merge_rejects_invalid_bundles_without_writing(self):
+        nested = Path(self.temp.name) / "state" / "nested" / "catalog.json"
+        empty_catalog = DatasetCatalog(nested)
+        bad_bundles = [
+            [], None, "x", 1, True, {},
+            {"datasets": None}, {"datasets": {}}, {"datasets": "x"}, {"datasets": 1},
+            {"other": []},
+            {"datasets": [None]},
+            {"datasets": ["x"]},
+            {"datasets": [{"id": "bad id", "fields": [{"name": "n", "type": "integer"}]}]},
+            {"datasets": [{"id": "a"}]},
+            {"datasets": [{"id": "a", "fields": [{"name": "n", "type": "float"}]}]},
+            {"datasets": [self._snapshot_record("a"), self._snapshot_record("a")]},
+            {"datasets": [self._snapshot_record("a", ["a"])]},
+            {"datasets": [self._snapshot_record("a", ["b", "b"])]},
+            {"datasets": [self._snapshot_record("a", ["ghost"])]},
+            {"datasets": [self._snapshot_record("a", ["b"]),
+                          self._snapshot_record("b", ["a"])]},
+            {"datasets": [self._snapshot_record("a", tags=[""])]},
+            {"datasets": [{**self._snapshot_record("a"), "owner": "  "}]},
+        ]
+        for bundle in bad_bundles:
+            with self.assertRaises(ValueError):
+                empty_catalog.merge_bundle(bundle)
+        self.assertFalse(nested.exists())
+        self.assertFalse(nested.parent.exists())
+
+        self.catalog.import_bundle({"datasets": [
+            self._snapshot_record("a"), self._snapshot_record("b", ["a"])]})
+        before = self.path.read_text(encoding="utf-8")
+        extra = [
+            # a batch record may not depend on a missing id even through a sibling
+            {"datasets": [self._snapshot_record("c", ["ghost"])]},
+            # replacing a with a record depending on its dependent b cycles
+            {"datasets": [self._snapshot_record("a", ["b"])]},
+            # a batch-internal cycle through an existing record
+            {"datasets": [self._snapshot_record("c", ["a"]),
+                          self._snapshot_record("a", ["c"])]},
+        ]
+        for bundle in bad_bundles + extra:
+            with self.assertRaises(ValueError):
+                self.catalog.merge_bundle(bundle)
+            self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_merge_validates_current_catalog_like_apply(self):
+        good = {"datasets": [self._snapshot_record("new")]}
+        bad_states = [
+            json.dumps([self._snapshot_record("a")]),
+            json.dumps({"a": "x"}),
+            json.dumps({"a": self._snapshot_record("a", ["ghost"])}),
+            json.dumps({"a": self._snapshot_record("a", ["a"])}),
+            json.dumps({"a": self._snapshot_record("a", ["b", "b"]),
+                        "b": self._snapshot_record("b")}),
+            json.dumps({"a": {**self._snapshot_record("a"), "id": "other"}}),
+            json.dumps({"a": self._snapshot_record("a", ["b"]),
+                        "b": self._snapshot_record("b", ["a"])}),
+        ]
+        for index, raw in enumerate(bad_states):
+            other = Path(self.temp.name) / ("bad-merge-" + str(index) + ".json")
+            other.write_text(raw, encoding="utf-8")
+            with self.assertRaises(ValueError):
+                DatasetCatalog(other).merge_bundle(good)
+            self.assertEqual(other.read_text(encoding="utf-8"), raw)
+
+    def test_merge_does_not_mutate_input_and_result_is_detached(self):
+        self.catalog.import_bundle({"datasets": [self._snapshot_record("a")]})
+        bundle = {"datasets": [
+            self._snapshot_record("a", description="changed"),
+            self._snapshot_record("b", ["a"], tags=[" Finance ", "finance"])]}
+        snapshot = json.loads(json.dumps(bundle))
+        result = self.catalog.merge_bundle(bundle)
+        self.assertEqual(bundle, snapshot)
+        result["added"][0]["tags"].append("tampered")
+        result["changed"][0]["after"]["description"] = "tampered"
+        fresh = DatasetCatalog(self.path)
+        self.assertEqual(fresh.describe("b")["tags"], ["Finance"])
+        self.assertEqual(fresh.describe("a")["description"], "changed")
+        self.assertEqual(self.catalog.merge_bundle(bundle),
+                         {"added": [], "removed": [], "changed": []})
+
+    def test_merge_save_failure_raises_oserror_and_preserves_state(self):
+        self.catalog.register(self._snapshot_record("old"))
+        before = self.path.read_text(encoding="utf-8")
+        bundle = {"datasets": [self._snapshot_record("new")]}
+        with mock.patch("dataset_catalog.os.replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                self.catalog.merge_bundle(bundle)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+        self.assertEqual([row["id"] for row in self.catalog.export()["datasets"]], ["old"])
+        leftovers = [item for item in self.path.parent.iterdir() if item != self.path]
+        self.assertEqual(leftovers, [])
+
+        nested = Path(self.temp.name) / "empty" / "catalog.json"
+        nested.parent.mkdir(parents=True)
+        missing = DatasetCatalog(nested)
+        with mock.patch("dataset_catalog.os.replace", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                missing.merge_bundle(bundle)
+        self.assertFalse(nested.exists())
+        self.assertEqual(list(nested.parent.iterdir()), [])
+
+    def test_cli_merge(self):
+        prefix = [sys.executable, str(ROOT / "dataset_catalog.py"), "--catalog", str(self.path)]
+        subprocess.run(prefix + ["register", str(ROOT / "samples/orders.json")],
+                       check=True, capture_output=True)
+        subprocess.run(prefix + ["register", str(ROOT / "samples/daily.json")],
+                       check=True, capture_output=True)
+
+        bundle_path = Path(self.temp.name) / "merge.json"
+        bundle_path.write_text(json.dumps({"datasets": [
+            {"id": "orders", "description": "replaced",
+             "fields": [{"name": "amount", "type": "number"}]},
+            {"id": "report", "fields": [{"name": "id", "type": "string"}],
+             "depends_on": ["daily_totals"]}]}), encoding="utf-8")
+        run = subprocess.run(prefix + ["merge", str(bundle_path)],
+                             capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        result = json.loads(run.stdout)
+        self.assertEqual(set(result), {"added", "removed", "changed"})
+        self.assertEqual([row["id"] for row in result["added"]], ["report"])
+        self.assertEqual(result["removed"], [])
+        self.assertEqual([row["id"] for row in result["changed"]], ["orders"])
+        exported = subprocess.run(prefix + ["export"], capture_output=True, text=True)
+        self.assertEqual([row["id"] for row in json.loads(exported.stdout)["datasets"]],
+                         ["orders", "daily_totals", "report"])
+
+        rerun = subprocess.run(prefix + ["merge", str(bundle_path)],
+                               capture_output=True, text=True)
+        self.assertEqual(rerun.returncode, 0)
+        self.assertEqual(json.loads(rerun.stdout),
+                         {"added": [], "removed": [], "changed": []})
+
+        before = self.path.read_text(encoding="utf-8")
+        missing = subprocess.run(prefix + ["merge", str(Path(self.temp.name) / "nope.json")],
+                                 capture_output=True, text=True)
+        self.assertEqual(missing.returncode, 2)
+        self.assertIn("error", json.loads(missing.stdout))
+        bad_json = Path(self.temp.name) / "bad.json"
+        bad_json.write_text("{not json", encoding="utf-8")
+        run = subprocess.run(prefix + ["merge", str(bad_json)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+        invalid = Path(self.temp.name) / "invalid.json"
+        invalid.write_text(json.dumps({"datasets": [
+            {"id": "orders", "fields": [{"name": "n", "type": "integer"}],
+             "depends_on": ["daily_totals"]}]}), encoding="utf-8")
+        run = subprocess.run(prefix + ["merge", str(invalid)], capture_output=True, text=True)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn("error", json.loads(run.stdout))
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
 
     def _schema_record(self, identifier, fields, depends_on=None, description="s", **extra):
         record = {"id": identifier, "description": description,
